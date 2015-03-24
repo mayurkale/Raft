@@ -1,0 +1,11 @@
+{
+"Path":{"Path":"logs/"},
+"Servers":[
+    {"Id":"1", "Hostname":"127.0.0.1" ,"ClientPort":"9001","LogPort":"5001"},
+    {"Id":"2", "Hostname":"127.0.0.1" ,"ClientPort":"9002","LogPort":"5002"},
+    {"Id":"3", "Hostname":"127.0.0.1" ,"ClientPort":"9003","LogPort":"5003"},
+    {"Id":"4", "Hostname":"127.0.0.1" ,"ClientPort":"9004","LogPort":"5004"},
+    {"Id":"5", "Hostname":"127.0.0.1" ,"ClientPort":"9005","LogPort":"5005"}
+],
+"Count":{"Count":"5"}
+}
