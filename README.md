@@ -1,3 +1,13 @@
+#NOTE:
+Assignment is not ready to evaluate yet. I have coded leader election but it's not working properly as of now, will debug code and try to complete code over the upcoming weekend.
+
+
+
+
+
+
+
+
 # Replicated Key Value Store
 
 In this implementation, we have developed a replicated store shared by multiple servers, with the help of a shared log structure and majority consensus based commit.
