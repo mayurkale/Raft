@@ -32,6 +32,7 @@ const (
 	CONFIRMCONSENSUS = 2
 	REQUESTVOTE      = 3
 	VOTERESPONSE     = 4
+	APPENDENTRIES    = 5
 )
 
 const (
@@ -86,8 +87,9 @@ type Raft struct {
 	Pid           int
 	Peers         []int
 	Path          string
-	Term          int            // Current term ID for raft object.(Monotonic increase)
-	VotedFor      int            // Server ID for which this raft has voted in leader election.
+	Term          int // Current term ID for raft object.(Monotonic increase)
+	VotedFor      int // Server ID for which this raft has voted in leader election.
+	VotedTerm     int
 	LeaderId      int            //Current Leader ID
 	CommitIndex   uint64         //Index of the highest entry commited till time.(Monotonic increase)
 	MatchIndex    map[int]uint64 //Index fo the highest log entry known to be replicated on server for all peers.
@@ -145,6 +147,8 @@ type Server interface {
 
 	candidate()
 
+	leader()
+
 	GetPrevLogIndex() uint64
 
 	GetPrevLogTerm() int
@@ -154,6 +158,8 @@ type Server interface {
 	SetVotedFor(int)
 
 	requestForVoteToPeers()
+
+	handleRequestVote(env *Envelope) bool
 }
 
 func (ServerVar *Raft) Start() {
@@ -240,17 +246,59 @@ func (ServerVar *Raft) loop() {
 
 		case CANDIDATE:
 			ServerVar.candidate()
-			/*
-				case LEADER:
-					state = ServerVar.leader()
-			*/
+
+		case LEADER:
+			ServerVar.leader()
+
 		default:
 			return
 		}
 	}
 }
 
+func (ServerVar *Raft) leader() {
+
+	for {
+		select {
+
+		case env := <-(ServerVar.Inbox()):
+			switch env.MessageId {
+
+			case REQUESTVOTE:
+
+				if debug {
+					fmt.Println("Received request vote for candidate....")
+				}
+
+				downgrade := ServerVar.handleRequestVote(env)
+
+				if downgrade {
+
+					//As leader downgrade will result in having unknown leader and going into follower state
+					ServerVar.LeaderId = UNKNOWN
+					ServerVar.State = FOLLOWER
+
+					return
+				}
+
+			case VOTERESPONSE:
+
+			case APPENDENTRIES:
+
+			}
+		}
+
+	}
+
+}
+
+func heartBeatInterval() time.Duration {
+	tm := MinElectTo / 5
+	return time.Duration(tm) * time.Millisecond
+}
+
 func (ServerVar *Raft) candidate() {
+
 	ServerVar.requestForVoteToPeers()
 
 	if debug {
@@ -279,11 +327,18 @@ func (ServerVar *Raft) candidate() {
 			case REQUESTVOTE:
 
 				if debug {
-					fmt.Println("Received request vote for candidate....ignore")
+					fmt.Println("Received request vote for candidate....")
 				}
 
-				//Since any candidate would have already voted for self, we will ignore voting requests
-				break
+				downgrade := ServerVar.handleRequestVote(env)
+
+				if downgrade {
+
+					//As a candidate downgrade will result in having unknown leader and going into follower state
+					ServerVar.LeaderId = UNKNOWN
+					ServerVar.State = FOLLOWER
+					return
+				}
 
 			case VOTERESPONSE:
 
@@ -329,6 +384,8 @@ func (ServerVar *Raft) candidate() {
 
 					return
 				}
+
+			case APPENDENTRIES:
 
 			}
 
@@ -386,72 +443,90 @@ func (ServerVar *Raft) follower() {
 
 		case env := <-(ServerVar.Inbox()):
 
-			les := LogEntryStruct(env.Message)
+			//les := LogEntryStruct(env.Message)
 
 			switch env.MessageId {
 
 			case REQUESTVOTE:
 
-				if les.Term() < ServerVar.GetTerm() {
-					//Do not send response
-					//ServerVar.resetElectTimeout()
-					break
-				}
+				downgrade := ServerVar.handleRequestVote(env)
 
-				if les.Term() > ServerVar.GetTerm() {
+				if downgrade {
 
-					ServerVar.Term = les.Term()
-					ServerVar.VotedFor = NOVOTE
+					//As a follower downgrade will result in having unknown leader
 					ServerVar.LeaderId = UNKNOWN
-
 				}
 
-				if ServerVar.VotedFor != NOVOTE && ServerVar.VotedFor != env.SenderId {
-					//Do not send response
-					break
-				}
-
-				if ServerVar.GetPrevLogIndex() > env.LastLogIndex || ServerVar.PrevLogTerm > env.LastLogTerm {
-					//Do not send response
-					break
-				}
-
-				if ServerVar.GetVotedFor() == NOVOTE {
-
-					var lesn LogEntryStruct
-
-					(*ServerVar).LsnVar = (*ServerVar).LsnVar + 1
-					lesn.Logsn = Lsn((*ServerVar).LsnVar)
-					lesn.DataArray = nil
-					lesn.TermIndex = ServerVar.GetTerm()
-					lesn.Commit = false
-
-					var envVar Envelope
-					envVar.Pid = env.SenderId
-					envVar.MessageId = VOTERESPONSE
-					envVar.SenderId = ServerVar.ServId()
-					envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
-					envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
-					envVar.Message = lesn
-					//TODO: Whats below line??
-					//MsgAckMap[les.Lsn()] = 1
-
-					if debug {
-
-						fmt.Println("Sending vote for Candidate=", env.SenderId, " Term = ", lesn.TermIndex, " follower = ", envVar.SenderId)
-					}
-
-					ServerVar.VotedFor = env.SenderId
-					ServerVar.resetElectTimeout()
-					ServerVar.Outbox() <- &envVar
-
-				}
-
+			case VOTERESPONSE:
+			//TODO:
+			case APPENDENTRIES:
+				//TODO:
 			}
 
 		}
 	}
 
+}
+
+func (serverVar *Raft) handleRequestVote(req *Envelope) bool {
+	if req.Message.TermIndex < serverVar.Term {
+		return false
+	}
+
+	downgrade := false
+
+	if req.Message.TermIndex > serverVar.Term {
+		if debug {
+			fmt.Println("RequestVote from newer term (%d): my term %d", req.Message.TermIndex, serverVar.Term)
+		}
+		serverVar.Term = req.Message.TermIndex
+		serverVar.VotedFor = NOVOTE
+		serverVar.LeaderId = UNKNOWN
+		downgrade = true
+	}
+
+	if serverVar.GetState() == LEADER && !downgrade {
+
+		return false
+	}
+
+	if serverVar.VotedFor != NOVOTE && serverVar.VotedFor != req.SenderId {
+
+		return downgrade
+	}
+
+	if serverVar.PrevLogIndex > req.LastLogIndex || serverVar.PrevLogTerm > req.LastLogTerm {
+		return downgrade
+	}
+
+	var lesn LogEntryStruct
+
+	(*serverVar).LsnVar = (*serverVar).LsnVar + 1
+	lesn.Logsn = Lsn((*serverVar).LsnVar)
+	lesn.DataArray = nil
+	lesn.TermIndex = serverVar.GetTerm()
+	lesn.Commit = false
+
+	var envVar Envelope
+	envVar.Pid = req.SenderId
+	envVar.MessageId = VOTERESPONSE
+	envVar.SenderId = serverVar.ServId()
+	envVar.LastLogIndex = serverVar.GetPrevLogIndex()
+	envVar.LastLogTerm = serverVar.GetPrevLogTerm()
+	envVar.Message = lesn
+	//TODO: Whats below line??
+	//MsgAckMap[les.Lsn()] = 1
+
+	if debug {
+
+		fmt.Println("Sending vote for Candidate=", req.SenderId, " Term = ", lesn.TermIndex, " follower = ", envVar.SenderId)
+	}
+
+	serverVar.VotedFor = req.SenderId
+	serverVar.resetElectTimeout()
+	serverVar.Outbox() <- &envVar
+
+	return downgrade
 }
 
 //FireAServer() starts a server with forking methods to listen at a port for intra cluster comminication and for client-server communication
@@ -474,6 +549,7 @@ func FireAServer(myid int) Server {
 		Path:          "",
 		Term:          INITIALIZATION,
 		VotedFor:      NOVOTE,
+		VotedTerm:     UNKNOWN,
 		LeaderId:      UNKNOWN,
 		CommitIndex:   0,
 		ElectTicker:   nil,

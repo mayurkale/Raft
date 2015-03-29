@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"strconv"
 )
 
@@ -94,10 +95,17 @@ func (ServerVar *Raft) Append(data []byte) (LogEntry, error) {
 	var err ErrRedirect
 	if ServerVar.GetState() != LEADER {
 		err = ErrRedirect(ServerVar.GetLeader())
+
+		fmt.Println("THis is not leader ", ServerVar.ServId())
+		fmt.Println("GetLeader  = ", ServerVar.GetLeader())
 		MutexAppend.Unlock()
 		//unlock the MutexAppend Call lock
 		return LogEnt, err
 	}
+
+	fmt.Println("THis seems leader ", ServerVar.ServId())
+	fmt.Println("GetLeader  = ", ServerVar.GetLeader())
+	fmt.Println("GetState  = ", ServerVar.GetState())
 
 	var les LogEntryStruct
 
