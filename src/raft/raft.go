@@ -160,6 +160,10 @@ type Server interface {
 	requestForVoteToPeers()
 
 	handleRequestVote(env *Envelope) bool
+
+	sendHeartBeats()
+
+	handleAppendEntries(env *Envelope) (bool, bool)
 }
 
 func (ServerVar *Raft) Start() {
@@ -240,6 +244,7 @@ func (ServerVar *Raft) loop() {
 	for {
 
 		state := ServerVar.GetState() // begin life as a follower
+
 		switch state {
 		case FOLLOWER:
 			ServerVar.follower()
@@ -256,10 +261,78 @@ func (ServerVar *Raft) loop() {
 	}
 }
 
+func (ServerVar *Raft) sendHeartBeats() {
+
+	hbeat := time.NewTicker(heartBeatInterval())
+	defer hbeat.Stop()
+
+	for _ = range hbeat.C {
+
+		if ServerVar.State != LEADER {
+			return
+		}
+
+		var lesn LogEntryStruct
+
+		//(*ServerVar).LsnVar = (*ServerVar).LsnVar + 1
+		lesn.Logsn = Lsn((*ServerVar).LsnVar)
+		lesn.DataArray = nil
+		lesn.TermIndex = ServerVar.GetTerm()
+		lesn.Commit = false
+
+		var envVar Envelope
+		envVar.Pid = BROADCAST
+		envVar.MessageId = APPENDENTRIES
+		envVar.SenderId = ServerVar.ServId()
+		envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
+		envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
+		envVar.Message = lesn
+		ServerVar.Outbox() <- &envVar
+
+	}
+
+}
+
+func (ServerVar *Raft) handleAppendEntries(env *Envelope) (bool, bool) {
+
+	if env.Message.TermIndex < ServerVar.Term {
+
+		return false, false
+	}
+
+	success := true
+	downGrade := false
+
+	if env.Message.TermIndex > ServerVar.Term {
+		ServerVar.Term = env.Message.TermIndex
+		ServerVar.VotedFor = NOVOTE
+		downGrade = true
+
+	}
+
+	if ServerVar.State == CANDIDATE && env.SenderId != ServerVar.LeaderId && env.Message.TermIndex >= ServerVar.Term {
+		ServerVar.Term = env.Message.TermIndex
+		ServerVar.VotedFor = NOVOTE
+		downGrade = true
+	}
+	ServerVar.resetElectTimeout()
+
+	//TODO:Match prev log index
+
+	return success, downGrade
+
+}
+
 func (ServerVar *Raft) leader() {
+
+	//replicate := make(chan struct{})
+
+	go ServerVar.sendHeartBeats()
 
 	for {
 		select {
+
+		//case <-replication:
 
 		case env := <-(ServerVar.Inbox()):
 			switch env.MessageId {
@@ -284,6 +357,8 @@ func (ServerVar *Raft) leader() {
 			case VOTERESPONSE:
 
 			case APPENDENTRIES:
+				_, _ = ServerVar.handleAppendEntries(env)
+				//TODO: handle and count sucesses
 
 			}
 		}
@@ -387,6 +462,13 @@ func (ServerVar *Raft) candidate() {
 
 			case APPENDENTRIES:
 
+				_, downgrade := ServerVar.handleAppendEntries(env)
+				if downgrade {
+					ServerVar.LeaderId = env.SenderId
+					ServerVar.State = FOLLOWER
+					return
+				}
+
 			}
 
 		}
@@ -460,7 +542,17 @@ func (ServerVar *Raft) follower() {
 			case VOTERESPONSE:
 			//TODO:
 			case APPENDENTRIES:
-				//TODO:
+
+				if ServerVar.LeaderId == UNKNOWN {
+					ServerVar.LeaderId = env.SenderId
+
+				}
+
+				_, downgrade := ServerVar.handleAppendEntries(env)
+				if downgrade {
+					ServerVar.LeaderId = env.SenderId
+					return
+				}
 			}
 
 		}
@@ -469,6 +561,7 @@ func (ServerVar *Raft) follower() {
 }
 
 func (serverVar *Raft) handleRequestVote(req *Envelope) bool {
+
 	if req.Message.TermIndex < serverVar.Term {
 		return false
 	}
