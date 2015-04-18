@@ -116,11 +116,11 @@ func (ServerVar *Raft) parseSetCas(cmdtype int, res []string, conn net.Conn, rea
 
 }
 
-//AppendUtility() calls append() periodically after every 10 seconds for infinite time until consensus is reached among servers.
+//AppendUtility() calls append() periodically after every 3 seconds for infinite time until consensus is reached among servers.
 // Once concenus is arrived,it will return.
 func (ServerVar *Raft) AppendUtility(conn net.Conn, command *bytes.Buffer) {
 
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 
 	go func() {
 		for {
