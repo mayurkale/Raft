@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"fmt"
 	zmq "github.com/pebbe/zmq4"
 	"io/ioutil"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"os"
 )
 
 var debug = true
@@ -28,11 +30,15 @@ var LeaderID, Quorum int
 
 //Below constants are used to set message IDs.
 const (
-	APPENDENTRIESRPC = 1
-	CONFIRMCONSENSUS = 2
-	REQUESTVOTE      = 3
-	VOTERESPONSE     = 4
-	APPENDENTRIES    = 5
+	APPENDENTRIESRPC      = 1
+	CONFIRMCONSENSUS      = 2
+	REQUESTVOTE           = 3
+	VOTERESPONSE          = 4
+	APPENDENTRIES         = 5
+	APPENDENTRIESRESPONSE = 6
+	HEARTBEATRESPONSE     = 7
+	HEARTBEAT             = 8
+	APPENDENTRIESRPCRESPONSE      = 9
 )
 
 const (
@@ -58,7 +64,7 @@ var (
 	   and once it's wait is over, will start election all over again.
 	*/
 	MinElectTo int32 = 4000
-	MaxElectTo       = 2 * MinElectTo
+	MaxElectTo       = 3 * MinElectTo
 )
 
 type ServerConfig struct {
@@ -87,7 +93,7 @@ type Raft struct {
 	Pid           int
 	Peers         []int
 	Path          string
-	Term          int // Current term ID for raft object.(Monotonic increase)
+	Term          uint64 // Current term ID for raft object.(Monotonic increase)
 	VotedFor      int // Server ID for which this raft has voted in leader election.
 	VotedTerm     int
 	LeaderId      int            //Current Leader ID
@@ -95,7 +101,7 @@ type Raft struct {
 	MatchIndex    map[int]uint64 //Index fo the highest log entry known to be replicated on server for all peers.
 	NextIndex     map[int]uint64 //Index of the next log entry to send to that server for all peers (initialized to leader last log index + 1)
 	PrevLogIndex  uint64
-	PrevLogTerm   int
+	PrevLogTerm   uint64
 	ElectTicker   <-chan time.Time
 	State         int
 	LastApplied   uint64 //Index of the highest log entry applied to state machine.
@@ -107,7 +113,18 @@ type Raft struct {
 	LsnVar        uint64
 	ClusterSize   int
 	GotConsensus  chan bool
+	SLog          *Log
+	Inchan chan *[]byte
+        Outchan chan interface{}
 }
+
+//store index of all peer servers
+type nextIndex struct {
+	sync.RWMutex
+	m map[uint64]uint64 // followerId: nextIndex
+}
+
+//type appendEntriesResponse struct{}
 
 //Server interface declares functions that will be used to provide APIs to comminicate with server.
 type Server interface {
@@ -115,7 +132,7 @@ type Server interface {
 
 	PeersIds() []int
 
-	GetTerm() int //Returns current term for the shared log for this raft server.
+	GetTerm() uint64 //Returns current term for the shared log for this raft server.
 
 	GetLeader() int //Returns leader id for the current term.
 
@@ -151,9 +168,9 @@ type Server interface {
 
 	GetPrevLogIndex() uint64
 
-	GetPrevLogTerm() int
+	GetPrevLogTerm() uint64
 
-	SetTerm(int)
+	SetTerm(uint64)
 
 	SetVotedFor(int)
 
@@ -161,9 +178,9 @@ type Server interface {
 
 	handleRequestVote(env *Envelope) bool
 
-	sendHeartBeats()
+	sendHeartBeats(ni *nextIndex) (int, bool)
 
-	handleAppendEntries(env *Envelope) (bool, bool)
+	handleAppendEntries(env *Envelope) (*appendEntriesResponse, bool)
 }
 
 func (ServerVar *Raft) Start() {
@@ -172,7 +189,7 @@ func (ServerVar *Raft) Start() {
 
 }
 
-func (ServerVar *Raft) SetTerm(term int) {
+func (ServerVar *Raft) SetTerm(term uint64) {
 	ServerVar.Term = term
 
 }
@@ -181,7 +198,7 @@ func (ServerVar *Raft) GetPrevLogIndex() uint64 {
 	return (*ServerVar).PrevLogIndex
 }
 
-func (ServerVar *Raft) GetPrevLogTerm() int {
+func (ServerVar *Raft) GetPrevLogTerm() uint64 {
 	return (*ServerVar).PrevLogTerm
 }
 
@@ -197,7 +214,7 @@ func (ServerVar *Raft) GetCommitIndex() uint64 {
 	return (*ServerVar).CommitIndex
 }
 
-func (ServerVar *Raft) GetTerm() int {
+func (ServerVar *Raft) GetTerm() uint64 {
 	return (*ServerVar).Term
 }
 
@@ -261,65 +278,260 @@ func (ServerVar *Raft) loop() {
 	}
 }
 
-func (ServerVar *Raft) sendHeartBeats() {
+func (ServerVar *Raft) catchUpLog(ni *nextIndex, id int) error {
 
-	hbeat := time.NewTicker(heartBeatInterval())
-	defer hbeat.Stop()
+	
+	//curLsn := ServerVar.SLog.getCurrentIndex() + 1
+	//resultentries, lastTerm := ServerVar.SLog.entriesAfter(curLsn)
+	currentTerm := ServerVar.Term
 
-	for _ = range hbeat.C {
+	prevLogIndex := ni.prevLogIndex(uint64(id))
 
-		if ServerVar.State != LEADER {
-			return
+	resultentries, _ := ServerVar.SLog.entriesAfter(prevLogIndex,10)
+
+	//commitIndex := ServerVar.SLog.getCommitIndex()
+
+	var envVar Envelope
+	envVar.Pid = id
+	envVar.MessageId = APPENDENTRIES
+	envVar.SenderId = ServerVar.ServId()
+	envVar.Leaderid = ServerVar.LeaderId
+	envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
+	envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
+	envVar.CommitIndex = ServerVar.GetCommitIndex()
+	envVar.Message = &appendEntries{TermIndex: currentTerm, Entries: resultentries}
+	ServerVar.Outbox() <- &envVar
+
+	select {
+
+	//case <-replication:
+
+	case env := <-(ServerVar.Inbox()):
+		switch env.MessageId {
+
+		case APPENDENTRIESRESPONSE:
+
+			/*if debug {
+
+				fmt.Println("Received heartbeat response from %v", id)
+			}
+*/
+			resp := env.Message.(appendEntriesResponse)
+			if resp.Term > currentTerm {
+				return errorDeposed
+			}
+
+			if !resp.Success {
+				newPrevLogIndex, err := ni.decrement(uint64(id), prevLogIndex)
+				fmt.Println("new index for ", id, "is", newPrevLogIndex)
+				if err != nil {
+
+					return err
+				}
+				if debug {
+					fmt.Println("flush to %v: rejected")
+				}
+				return errorappendEntriesRejected
+			}
+
+			if len(resultentries) > 0 {
+				newPrevLogIndex, err := ni.set(uint64(id), uint64(resultentries[len(resultentries)-1].Lsn()), prevLogIndex)
+				fmt.Println("new index for ", id, "is", newPrevLogIndex)
+				if err != nil {
+
+					return err
+				}
+
+				return nil
+			}
+			return nil
+
 		}
 
-		var lesn LogEntryStruct
-
-		//(*ServerVar).LsnVar = (*ServerVar).LsnVar + 1
-		lesn.Logsn = Lsn((*ServerVar).LsnVar)
-		lesn.DataArray = nil
-		lesn.TermIndex = ServerVar.GetTerm()
-		lesn.Commit = false
-
-		var envVar Envelope
-		envVar.Pid = BROADCAST
-		envVar.MessageId = APPENDENTRIES
-		envVar.SenderId = ServerVar.ServId()
-		envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
-		envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
-		envVar.Message = lesn
-		ServerVar.Outbox() <- &envVar
-
 	}
-
+	return nil
 }
 
-func (ServerVar *Raft) handleAppendEntries(env *Envelope) (bool, bool) {
+func (ServerVar *Raft) handleAppendEntries(env *Envelope) (*appendEntriesResponse, bool) {
 
-	if env.Message.TermIndex < ServerVar.Term {
-
-		return false, false
+	resp := env.Message.(appendEntries)
+	if debug {
+		fmt.Println("handleAppendEntries() : Fo server ", ServerVar.ServId(), " Term : ", ServerVar.Term, " Requested Term = ", resp.TermIndex, "Coommit index ", env.CommitIndex, " ServerVar.SLog.commitIndex ", ServerVar.SLog.commitIndex)
 	}
 
-	success := true
+	if resp.TermIndex < ServerVar.Term {
+
+	
+		return &appendEntriesResponse{
+			Term:    ServerVar.Term,
+			Success: false,
+			reason:  fmt.Sprintf("Term is less"),
+		}, false
+	}
+
+	//success := true
 	downGrade := false
 
-	if env.Message.TermIndex > ServerVar.Term {
-		ServerVar.Term = env.Message.TermIndex
+	if resp.TermIndex > ServerVar.Term {
+		ServerVar.Term = resp.TermIndex
 		ServerVar.VotedFor = NOVOTE
 		downGrade = true
 
 	}
 
-	if ServerVar.State == CANDIDATE && env.SenderId != ServerVar.LeaderId && env.Message.TermIndex >= ServerVar.Term {
-		ServerVar.Term = env.Message.TermIndex
+	if ServerVar.State == CANDIDATE && env.SenderId != ServerVar.LeaderId && resp.TermIndex >= ServerVar.Term {
+		ServerVar.Term = resp.TermIndex
 		ServerVar.VotedFor = NOVOTE
 		downGrade = true
 	}
 	ServerVar.resetElectTimeout()
 
-	//TODO:Match prev log index
+	
+	if err := ServerVar.SLog.discardEntries(env.LastLogIndex, env.LastLogTerm); err != nil {
+	
+		return &appendEntriesResponse{
+			Term:    ServerVar.Term,
+			Success: false,
+			reason:  fmt.Sprintf("while ensuring last log entry had index=%d term=%d: error: %s", env.LastLogIndex, env.LastLogTerm, err)}, downGrade
+	}
 
-	return success, downGrade
+	
+	//resp := env.Message.(appendEntries)
+
+	for i, entry := range resp.Entries {
+fmt.Println("Number of times ",i)
+		if err := ServerVar.SLog.appendEntry(entry); err != nil {
+
+			
+			return &appendEntriesResponse{
+				Term:    ServerVar.Term,
+				Success: false,
+				reason: fmt.Sprintf(
+					"AppendEntry %d/%d failed: %s",
+					i+1,
+					len(resp.Entries),
+					err,
+				),
+			}, downGrade
+
+		}
+
+	}
+
+	if env.CommitIndex > 0 && env.CommitIndex > ServerVar.SLog.commitIndex {
+
+		if err := ServerVar.SLog.commitTill(env.CommitIndex); err != nil {
+
+			return &appendEntriesResponse{
+				Term:    ServerVar.Term,
+				Success: false,
+				reason:  fmt.Sprintf("CommitTo failed"),
+			}, downGrade
+		}
+
+	}
+
+
+	return &appendEntriesResponse{
+		Term:    ServerVar.Term,
+		Success: true,
+	}, downGrade
+
+}
+
+var (
+	errorTimeout               = errors.New("Time out while log replication")
+	errorDeposed               = errors.New("Deposed during replication")
+	errorOutOfSync             = errors.New("Out of sync")
+	errorappendEntriesRejected = errors.New("AppendEntries RPC rejected")
+)
+
+type appendEntries struct {
+	TermIndex uint64
+	Entries   []*LogEntryStruct
+}
+
+// appendEntriesResponse represents the response to an appendEntries RPC.
+type appendEntriesResponse struct {
+	Term    uint64
+	Success bool
+	reason  string
+}
+
+func (ServerVar *Raft) newNextIndex(defaultNextIndex uint64) *nextIndex {
+	ni := &nextIndex{
+		m: map[uint64]uint64{},
+	}
+	for _, id := range ServerVar.PeersIds() {
+		ni.m[uint64(id)] = defaultNextIndex
+	}
+	return ni
+}
+
+func (ni *nextIndex) prevLogIndex(id uint64) uint64 {
+	ni.RLock()
+	defer ni.RUnlock()
+	if _, ok := ni.m[id]; !ok {
+		panic(fmt.Sprintf("peer %d not found", id))
+	}
+	return ni.m[id]
+}
+
+func (ni *nextIndex) decrement(id uint64, prev uint64) (uint64, error) {
+	ni.Lock()
+	defer ni.Unlock()
+	i, ok := ni.m[id]
+	if !ok {
+		panic(fmt.Sprintf("peer %d not found", id))
+	}
+	if i != prev {
+		return i, errorOutOfSync
+	}
+	if i > 0 {
+		ni.m[id]--
+	}
+	return ni.m[id], nil
+}
+
+func (ni *nextIndex) set(id, index, prev uint64) (uint64, error) {
+	ni.Lock()
+	defer ni.Unlock()
+	i, ok := ni.m[id]
+	if !ok {
+		panic(fmt.Sprintf("server %d not found", id))
+	}
+	if i != prev {
+		return i, errorOutOfSync
+	}
+	ni.m[id] = index
+	return index, nil
+}
+
+func (ServerVar *Raft) sendHeartBeats(ni *nextIndex) (int, bool) {
+
+	type tuple struct {
+		id  uint64
+		err error
+	}
+	responses := make(chan tuple, len(ServerVar.PeersIds()))
+	for _, id1 := range ServerVar.PeersIds() {
+		go func(id int) {
+			errChan := make(chan error, 1)
+			go func() { errChan <- ServerVar.catchUpLog(ni, id) }()
+			responses <- tuple{uint64(id), <-errChan}
+		}(id1)
+	}
+	successes, downGrade := 0, false
+	for i := 0; i < cap(responses); i++ {
+		switch t := <-responses; t.err {
+		case nil:
+			successes++
+		case errorDeposed:
+			downGrade = true
+		default:
+		}
+	}
+	return successes, downGrade
 
 }
 
@@ -327,12 +539,73 @@ func (ServerVar *Raft) leader() {
 
 	//replicate := make(chan struct{})
 
-	go ServerVar.sendHeartBeats()
+	replicate := make(chan struct{})
+
+	hbeat := time.NewTicker(heartBeatInterval())
+
+	defer hbeat.Stop()
+	go func() {
+		for _ = range hbeat.C {
+			replicate <- struct{}{}
+		}
+	}()
+
+	nIndex := ServerVar.newNextIndex(uint64(ServerVar.SLog.lastIndex()))
+
+	//go ServerVar.sendHeartBeats(nIndex)
 
 	for {
 		select {
+		
+		
+		case t := <-ServerVar.Outchan:
+cmd := t.(Command)
+// Append the command to our (leader) log
+fmt.Println("got command, appending", ServerVar.Term)
+currentTerm := ServerVar.Term
 
-		//case <-replication:
+		comma := new(bytes.Buffer)
+		encCommand := gob.NewEncoder(comma)
+		encCommand.Encode(cmd)
+
+entry := &LogEntryStruct{
+		Logsn: Lsn(ServerVar.SLog.lastIndex() + 1),
+		TermIndex: currentTerm,
+		DataArray: comma.Bytes(),
+		//Commit : <- false,//cmd.CommandResponse,
+		}
+
+		if err := ServerVar.SLog.appendEntry(entry); err != nil {
+		panic(err)
+		continue
+		}
+
+fmt.Printf(
+"after append, commitIndex=%d lastIndex=%d lastTerm=%d",
+ServerVar.SLog.getCommitIndex(),
+ServerVar.SLog.lastIndex(),
+ServerVar.SLog.lastTerm(),
+)
+go func() { replicate <- struct{}{} }()
+		
+		
+
+		case <-replicate:
+
+			successes, downGrade := ServerVar.sendHeartBeats(nIndex)
+
+			if downGrade {
+
+				//As leader downgrade will result in having unknown leader and going into follower state
+				ServerVar.LeaderId = UNKNOWN
+				ServerVar.State = FOLLOWER
+
+				return
+			}
+
+			if successes >= Quorum-1 {
+
+			}
 
 		case env := <-(ServerVar.Inbox()):
 			switch env.MessageId {
@@ -357,8 +630,60 @@ func (ServerVar *Raft) leader() {
 			case VOTERESPONSE:
 
 			case APPENDENTRIES:
-				_, _ = ServerVar.handleAppendEntries(env)
+
+				resp, down := ServerVar.handleAppendEntries(env)
+
+				var envVar Envelope
+				envVar.Pid = env.Leaderid
+				envVar.MessageId = APPENDENTRIESRESPONSE
+				envVar.SenderId = ServerVar.ServId()
+				envVar.Leaderid = ServerVar.LeaderId
+				envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
+				envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
+				envVar.CommitIndex = ServerVar.GetCommitIndex()
+				envVar.Message = resp
+				
+				//fmt.Println("Before sending  ",ServerVar.ServId())
+				ServerVar.Outbox() <- &envVar
+				//fmt.Println("After sending  ",ServerVar.ServId())
 				//TODO: handle and count sucesses
+
+				if down {
+					ServerVar.LeaderId = env.Leaderid
+					ServerVar.State = FOLLOWER
+					return
+
+				}
+
+			case APPENDENTRIESRPC:
+				resp, down := ServerVar.handleAppendEntries(env)
+
+				var envVar Envelope
+				envVar.Pid = env.Leaderid
+				envVar.MessageId = APPENDENTRIESRPCRESPONSE
+				envVar.SenderId = ServerVar.ServId()
+				envVar.Leaderid = ServerVar.LeaderId
+				envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
+				envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
+				envVar.CommitIndex = ServerVar.GetCommitIndex()
+				envVar.Message = resp
+				ServerVar.Outbox() <- &envVar
+
+				//TODO: handle and count sucesses
+
+				if down {
+					ServerVar.LeaderId = env.Leaderid
+					ServerVar.State = FOLLOWER
+					return
+
+				}
+				
+			case APPENDENTRIESRPCRESPONSE:
+			fmt.Println("Received....Response.......................")
+				resp := env.Message.(appendEntriesResponse)
+				
+				 ConfirmConsensus(ServerVar.ServId(), ServerVar,&resp)	
+				
 
 			}
 		}
@@ -395,7 +720,11 @@ func (ServerVar *Raft) candidate() {
 
 		case env := <-(ServerVar.Inbox()):
 
-			les := LogEntryStruct(env.Message)
+			//les := env.Message.(LogEntryStruct)
+
+			if debug {
+				fmt.Println("CANDIDATE : Received Message is %v for %d ", env.MessageId, ServerVar.ServId())
+			}
 
 			switch env.MessageId {
 
@@ -416,7 +745,7 @@ func (ServerVar *Raft) candidate() {
 				}
 
 			case VOTERESPONSE:
-
+				les := env.Message.(LogEntryStruct)
 				if les.TermIndex > ServerVar.Term {
 					ServerVar.LeaderId = UNKNOWN
 					ServerVar.State = FOLLOWER
@@ -462,11 +791,56 @@ func (ServerVar *Raft) candidate() {
 
 			case APPENDENTRIES:
 
-				_, downgrade := ServerVar.handleAppendEntries(env)
-				if downgrade {
-					ServerVar.LeaderId = env.SenderId
+				resp, down := ServerVar.handleAppendEntries(env)
+
+				var envVar Envelope
+				envVar.Pid = env.Leaderid
+				envVar.MessageId = APPENDENTRIESRESPONSE
+				envVar.SenderId = ServerVar.ServId()
+				envVar.Leaderid = ServerVar.LeaderId
+				envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
+				envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
+				envVar.CommitIndex = ServerVar.GetCommitIndex()
+				envVar.Message = resp
+				ServerVar.Outbox() <- &envVar
+
+				if down {
+					ServerVar.LeaderId = env.Leaderid
 					ServerVar.State = FOLLOWER
 					return
+
+				}
+
+			case APPENDENTRIESRPC:
+
+				if debug {
+					fmt.Println("CANDIDATE : Processing Message is %v for %d ", env.MessageId, ServerVar.ServId())
+				}
+
+				resp, down := ServerVar.handleAppendEntries(env)
+
+				var envVar Envelope
+				envVar.Pid = env.Leaderid
+				envVar.MessageId = APPENDENTRIESRPCRESPONSE
+				envVar.SenderId = ServerVar.ServId()
+				envVar.Leaderid = ServerVar.LeaderId
+				envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
+				envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
+				envVar.CommitIndex = ServerVar.GetCommitIndex()
+				envVar.Message = resp
+				
+				ServerVar.Outbox() <- &envVar
+
+				if debug {
+					fmt.Println("CANDIDATE : Sending Message is %v for %d ", env.MessageId, ServerVar.ServId())
+				}
+				//TODO: handle and count sucesses
+
+				if down {
+					ServerVar.LeaderId = env.Leaderid
+					ServerVar.State = FOLLOWER
+					return
+
 				}
 
 			}
@@ -477,15 +851,18 @@ func (ServerVar *Raft) candidate() {
 }
 
 func (ServerVar *Raft) requestForVoteToPeers() {
+	
+	
 	var lesn LogEntryStruct
 
 	(*ServerVar).LsnVar = (*ServerVar).LsnVar + 1
 	lesn.Logsn = Lsn((*ServerVar).LsnVar)
 	lesn.DataArray = nil
 	lesn.TermIndex = ServerVar.GetTerm()
-	lesn.Commit = false
-
-	var envVar Envelope
+	
+        lesn.Commit = nil
+	
+		var envVar Envelope
 	envVar.Pid = BROADCAST
 	envVar.MessageId = REQUESTVOTE
 	envVar.SenderId = ServerVar.ServId()
@@ -495,8 +872,11 @@ func (ServerVar *Raft) requestForVoteToPeers() {
 	//TODO: Whats below line??
 	//MsgAckMap[les.Lsn()] = 1
 	ServerVar.VotedFor = ServerVar.ServId()
+	
+	
 	ServerVar.Outbox() <- &envVar
-
+	
+	
 }
 
 func (ServerVar *Raft) follower() {
@@ -525,6 +905,8 @@ func (ServerVar *Raft) follower() {
 
 		case env := <-(ServerVar.Inbox()):
 
+			
+
 			//les := LogEntryStruct(env.Message)
 
 			switch env.MessageId {
@@ -548,11 +930,53 @@ func (ServerVar *Raft) follower() {
 
 				}
 
-				_, downgrade := ServerVar.handleAppendEntries(env)
-				if downgrade {
-					ServerVar.LeaderId = env.SenderId
+				resp, down := ServerVar.handleAppendEntries(env)
+
+				var envVar Envelope
+				envVar.Pid = env.Leaderid
+				envVar.MessageId = APPENDENTRIESRESPONSE
+				envVar.SenderId = ServerVar.ServId()
+				envVar.Leaderid = ServerVar.LeaderId
+				envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
+				envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
+				envVar.CommitIndex = ServerVar.GetCommitIndex()
+				envVar.Message = resp
+				
+				fmt.Println("B4 Sending ",ServerVar.ServId())
+				ServerVar.Outbox() <- &envVar
+fmt.Println("After Sending ",ServerVar.ServId())
+				//TODO: handle and count sucesses
+
+				if down {
+					ServerVar.LeaderId = env.Leaderid
+					ServerVar.State = FOLLOWER
 					return
+
 				}
+
+			case APPENDENTRIESRPC:			
+
+				resp, down := ServerVar.handleAppendEntries(env)
+				var envVar Envelope
+				envVar.Pid = env.Leaderid
+				envVar.MessageId = APPENDENTRIESRPCRESPONSE
+				envVar.SenderId = ServerVar.ServId()
+				envVar.Leaderid = ServerVar.LeaderId
+				envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
+				envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
+				envVar.CommitIndex = ServerVar.GetCommitIndex()
+				envVar.Message = resp
+				ServerVar.Outbox() <- &envVar
+
+				//TODO: handle and count sucesses
+
+				if down {
+					ServerVar.LeaderId = env.Leaderid
+					ServerVar.State = FOLLOWER
+					return
+
+				}
+
 			}
 
 		}
@@ -562,17 +986,19 @@ func (ServerVar *Raft) follower() {
 
 func (serverVar *Raft) handleRequestVote(req *Envelope) bool {
 
-	if req.Message.TermIndex < serverVar.Term {
+	resp := req.Message.(LogEntryStruct)
+
+	if resp.TermIndex < serverVar.Term {
 		return false
 	}
 
 	downgrade := false
 
-	if req.Message.TermIndex > serverVar.Term {
+	if resp.TermIndex > serverVar.Term {
 		if debug {
-			fmt.Println("RequestVote from newer term (%d): my term %d", req.Message.TermIndex, serverVar.Term)
+			fmt.Println("RequestVote from newer term (%d): my term %d", resp.TermIndex, serverVar.Term)
 		}
-		serverVar.Term = req.Message.TermIndex
+		serverVar.Term = resp.TermIndex
 		serverVar.VotedFor = NOVOTE
 		serverVar.LeaderId = UNKNOWN
 		downgrade = true
@@ -598,7 +1024,7 @@ func (serverVar *Raft) handleRequestVote(req *Envelope) bool {
 	lesn.Logsn = Lsn((*serverVar).LsnVar)
 	lesn.DataArray = nil
 	lesn.TermIndex = serverVar.GetTerm()
-	lesn.Commit = false
+	lesn.Commit = nil
 
 	var envVar Envelope
 	envVar.Pid = req.SenderId
@@ -636,6 +1062,12 @@ func FireAServer(myid int) Server {
 
 	json.Unmarshal(file, &obj)
 
+
+
+	logfile := os.Getenv("GOPATH") + "/log/log_" + strconv.Itoa(myid)
+
+	tLog := createNewLog(logfile)
+
 	serverVar := &Raft{
 		Pid:           UNKNOWN,
 		Peers:         make([]int, len(obj.Servers)-1),
@@ -658,8 +1090,11 @@ func FireAServer(myid int) Server {
 		ClientSockets: make(map[int]*zmq.Socket),
 		LsnVar:        0,
 		LogSockets:    make(map[int]*zmq.Socket),
+		Inchan: make(chan *[]byte, 1024),
+		Outchan: make(chan interface{}),
 		ClusterSize:   len(obj.Servers) - 1,
 		GotConsensus:  make(chan bool),
+		SLog:          tLog,
 	}
 
 	count := 0
@@ -697,6 +1132,10 @@ func FireAServer(myid int) Server {
 
 	}
 
+	gob.Register(LogEntryStruct{})
+	gob.Register(appendEntries{})
+	gob.Register(appendEntriesResponse{})
+
 	no_servers, _ := strconv.Atoi(obj.Count.Count)
 	Quorum = int(no_servers/2 + 1.0)
 	for i := range serverVar.PeersIds() {
@@ -719,7 +1158,10 @@ func FireAServer(myid int) Server {
 	// Fork methods for communication within cluster
 
 	//fmt.Println("Leader = ", LeaderID)
-
+	
+	serverVar.SLog.ApplyFunc = func(e *LogEntryStruct) {
+		serverVar.Inchan <- &(e.DataArray)
+		}
 	go SendMail(serverVar)
 	go GetMail(serverVar)
 
@@ -787,24 +1229,28 @@ func GetMail(ServerVar *Raft) {
 			log.Fatal("decode:", err)
 		}
 
-		if env.MessageId == 1 {
+/*		if env.MessageId == 1 {
 
 			go AppendEntriesRPC(ServerVar.ServId(), ServerVar)
 
 		} else if env.MessageId == 2 {
 
 			go ConfirmConsensus(ServerVar.ServId(), ServerVar)
-		}
+		}*/
 		(ServerVar.Inbox()) <- env
 
 	}
 }
 
 // Function to check if consensus from majority is achieved or not
-func ConfirmConsensus(Servid int, ServerVar *Raft) {
+func ConfirmConsensus(Servid int, ServerVar *Raft,resp *appendEntriesResponse) {
+
+
+	if resp.Success{
+
 	env := <-(ServerVar.Inbox())
 
-	les := LogEntryStruct(env.Message)
+	les := env.Message.(LogEntryStruct)
 
 	if _, exist := MsgAckMap[les.Lsn()]; exist {
 
@@ -818,11 +1264,13 @@ func ConfirmConsensus(Servid int, ServerVar *Raft) {
 
 	if MsgAckMap[les.Lsn()] == Quorum {
 
-		les.Commit = true
+		les.Commit <- true
 		(ServerVar.GotConsensus) <- true
 		CommitCh <- les
 		delete(MsgAckMap, les.Lsn())
 		MutexAppend.Unlock()
+	}
+	
 	}
 	return
 }

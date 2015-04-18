@@ -89,8 +89,8 @@ func KvReadCommitCh() {
 
 	for {
 		les := <-CommitCh
-
-		if les.Commit {
+		
+		if <-les.Commit {
 
 			var decoddata Command
 			cmddcd := bytes.NewBuffer(les.DataArray)

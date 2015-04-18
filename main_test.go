@@ -1,21 +1,21 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
+	//"bufio"
+	//"bytes"
 	"encoding/json"
-	"fmt"
-	"io"
+	//"fmt"
+	//"io"
 	"io/ioutil"
 	//"math/rand"
-	"net"
+	//"net"
 	"os"
 	"os/exec"
 	"raft"
 	"strconv"
-	"strings"
+	//"strings"
 	"sync"
-	"testing"
+	//	"testing"
 	"time"
 )
 
@@ -79,6 +79,8 @@ func execute_cmd(id int) {
 // Testcase to test basic Set and Get operation
 
 //..............................................................................................................................//
+
+/*
 func TestSetnGet(t *testing.T) {
 
 	tester := make(chan bool)
@@ -157,7 +159,7 @@ func check_SetnGet(t *testing.T, tester chan bool) {
 	}
 	conn.Close()
 }
-
+*/
 /*
 //..............................................................................................................................//
 
