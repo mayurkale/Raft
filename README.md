@@ -11,7 +11,9 @@ In this implementation, we have developed a replicated key-value store shared by
 In this architecture, there are multiple server machines containing the replica of the store, which accept commands from the client. One of the replica is elected as a leader using raft consensus algorithm. The client sends the command to the servers, which processes it only if it is the leader. Leader writes command in it's own log and sends append message to peers to get consensus for log entry commit, and once consensus is achieved it writes that command entry in it's own log and asks other peer servers to append log entry to their own log structure.
 
 For details of raft consensus algorithm please go through
-.. (Reference: In Search of an Understandable Consensus Algorithm)
+[In Search of an Understandable Consensus Algorithm](https://www.usenix.org/conference/atc14/technical-sessions/presentation/ongaro)
+
+
 
 ## Run Instructions:
 
