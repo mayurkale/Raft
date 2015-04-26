@@ -86,15 +86,18 @@ if debug {
 func KvReadCommitCh() {
 
 	for {
-		les := <-CommitCh
-
+		ConnectionMsg := <-CommitCh
+		
+		les := ConnectionMsg.Les
+		conn := ConnectionMsg.Con
 		var decoddata1 Command
 		cmddcd1 := bytes.NewBuffer(les.DataArray)
 		cmd1 := gob.NewDecoder(cmddcd1)
 		cmd1.Decode(&decoddata1)
 
-//		fmt.Println("Got for commitch ", decoddata1.CmdType, " key = ", decoddata1.Key, "LSN = ", les.Logsn)
-
+		if debug{
+		fmt.Println("Got for commitch ", decoddata1.CmdType, " key = ", decoddata1.Key, "LSN = ", les.Logsn)
+}
 		var decoddata Command
 		cmddcd := bytes.NewBuffer(les.DataArray)
 		cmd := gob.NewDecoder(cmddcd)
@@ -125,11 +128,10 @@ func KvReadCommitCh() {
 			break
 		}
 
-		//Lock and unlock Logentry-client Map
-		MutexLog.RLock()
-		conn, _ := LogEntMap[les.Logsn] // conn is connection object to respond back to respective client
-		MutexLog.RUnlock()
 
+
+	
+//fmt.Println("Response = ",ret," connection = ",conn,"Logsn = ",les.Logsn)
 		//Response to client based on type of statement
 		conn.Write([]byte(ret))
 

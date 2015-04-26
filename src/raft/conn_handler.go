@@ -128,6 +128,9 @@ func (ServerVar *Raft) AppendUtility(conn net.Conn, command *bytes.Buffer, comma
 	if debug {
 		fmt.Println("SERVERINFO: I am ", ServerVar.ServId(), "And leader is ", ServerVar.GetLeader())
 	}
+	
+	
+	
 	var err ErrRedirect
 	if ServerVar.GetState() != LEADER {
 
@@ -139,6 +142,8 @@ func (ServerVar *Raft) AppendUtility(conn net.Conn, command *bytes.Buffer, comma
 		return
 
 	}
+	//fmt.Println("Append Utility() SERVERINFO: I am ", ServerVar.ServId(), "And leader is ", ServerVar.GetLeader())
+	//fmt.Println("Append Utility() Sending commands ",commandData.CmdType,"key = ",commandData.Key)
 
 	//fmt.Println("Append() This seems leader ", ServerVar.ServId())
 
@@ -176,18 +181,27 @@ func (ServerVar *Raft) AppendUtility(conn net.Conn, command *bytes.Buffer, comma
 	response := make(chan bool)
 	temp := &CommandTuple{Com: command.Bytes(), ComResponse: response}
 
+	//fmt.Println("Broadcasted... Lsn = ",les.Logsn,"connection = ",conn)
 	ServerVar.Outchan <- temp
 
 	//ServerVar.Outbox() <- &envVar
 
-	UpdateGlobLogEntMap(les, conn)
+	//UpdateGlobLogEntMap(les, conn)
 
+	//fmt.Println("Updating map ",les.Logsn," --- ",conn)
 	//fmt.Println("Append() lsn = ", les.Logsn)
 
+	var msgvar ConMsg
+	msgvar.Les = les
+	msgvar.Con = conn
+	
+	
 	select {
 	case t := <-response:
 		if t {
-			CommitCh <- les
+			
+			CommitCh <- msgvar
+			//fmt.Println("Received response for... LSN = ",les.Logsn,"connection = ",conn)
 			//delete(MsgAckMap, les.Lsn())
 
 		} else {
@@ -209,6 +223,7 @@ func UpdateGlobLogEntMap(les LogEntry, conn net.Conn) {
 		LogEntMap[les.Lsn()] = conn
 	}
 
+	fmt.Println("UpdateGlobLogEntMap updated", les.Lsn(),"---",LogEntMap[les.Lsn()])
 	MutexLog.Unlock()
 
 }

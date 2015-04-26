@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"time"
+	
 )
 
 type ErrRedirect int // See Log.Append. Implements Error interface.
@@ -17,7 +18,7 @@ var MsgAckMap map[Lsn]int
 var LogEntMap map[Lsn]net.Conn
 
 //CommitCh channel is used by sharedlog, to put commited Command entry onto channel for kvstore to execute
-var CommitCh chan LogEntryStruct
+var CommitCh chan ConMsg
 
 //Map for Key value store
 var keyval = make(map[string]valstruct)
@@ -77,7 +78,7 @@ var (
 	   Both candidate and follower state raft server will wait for random time between min and max election timeout
 	   and once it's wait is over, will start election all over again.
 	*/
-	MinElectTo int32 = 200
+	MinElectTo int32 = 100
 	MaxElectTo       = 3 * MinElectTo
 )
 
@@ -160,6 +161,12 @@ type Command struct {
 	Len        int
 	Value      []byte
 	Version    int64
+}
+
+type ConMsg struct{
+
+Les LogEntryStruct
+Con net.Conn
 }
 
 //Heap(Priority Queue Implementation) -- code functions taken from Golang ducumentation examples and edited

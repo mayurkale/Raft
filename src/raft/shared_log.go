@@ -15,7 +15,7 @@ import (
 func createNewLog(dbPath string) *Log {
 	db, err := leveldb.OpenFile(dbPath, nil)
 	if err != nil {
-		panic(fmt.Sprintf("dir not exist,%v", err))
+		panic(fmt.Sprintf("No such directory,%v", err))
 	}
 	l := &Log{
 		entries:     []*LogEntryStruct{},
@@ -49,7 +49,7 @@ func createNewLog(dbPath string) *Log {
 	return l
 }
 
-//Retrnt he current log index
+//Return the current log index
 func (l *Log) currentIndex() uint64 {
 	l.RLock()
 	defer l.RUnlock()
@@ -72,13 +72,13 @@ func (l *Log) close() {
 	l.entries = make([]*LogEntryStruct, 0)
 }
 
-//Does log contains the retry with perticular index and term
+//Checks if log contains the retry with perticular index and term
 func (l *Log) containsEntry(index uint64, term uint64) bool {
 	entry := l.getEntry(index)
 	return (entry != nil && uint64(entry.TermIndex) == term)
 }
 
-//get perticular entry by index
+//Returns particular entry by index
 func (l *Log) getEntry(index uint64) *LogEntryStruct {
 	l.RLock()
 	defer l.RUnlock()
@@ -121,7 +121,7 @@ func (l *Log) entriesAfter(index uint64, maxLogEntriesPerRequest uint64) ([]*Log
 	}
 }
 
-//close the response channel of entries store on disk (leveldb)
+//closes the response channel of entries store on disk (leveldb)
 func closeResponseChannels(a []*LogEntryStruct) []*LogEntryStruct {
 	stripped := make([]*LogEntryStruct, len(a))
 	for i, entry := range a {

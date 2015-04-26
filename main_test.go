@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	//"math/rand"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-var noOfThreads int = 3
+var noOfThreads int = 100
 var noOfRequestsPerThread int = 10
 
 //var wgroup sync.WaitGroup
@@ -158,13 +158,82 @@ func returnRandServ() int {
 	return -1
 }
 
-func killServer(id int) {
+func killServer(id int) error{
 
 	if err1 := procmap[id].Process.Kill(); err1 != nil {
-		fmt.Println("failed to kill: ", err1)
+		return err1
+		//fmt.Println("failed to kill: ", err1)
 	} else {
 		delete(servermap, id)
+		return nil
 	}
+}
+
+func random(min,max int) int{
+rand.Seed(time.Now().Unix())
+return rand.Intn(max-min) + min
+}
+
+
+
+
+//..............................................................................................................................//
+
+// Testcase: To test whether multiple clients works together properly.
+
+//..............................................................................................................................//
+
+func TestMulticlient(t *testing.T) {
+
+	tester := make(chan int)
+	Serv := get_LeaderId("1")
+	LeaderIdReturned := get_LeaderId(Serv)
+	for i := 0; i < noOfThreads; i++ {
+		go multiclient(t, tester, LeaderIdReturned)
+	}
+
+	count := 0
+	
+	
+	for count < noOfThreads {
+		<-tester
+		count += 1
+	//fmt.Println("test: count is ",count)
+	}
+	
+	if count != noOfThreads {
+		t.Error("TestMulticlient Failed")
+	} else {
+		fmt.Println("Testcase - TestMulticlient : Passed")
+	}
+
+}
+
+func multiclient(t *testing.T, tester chan int, LeaderIdReturned string) {
+
+	//Serv := returnRandServ()
+	//LeaderIdReturned := get_LeaderId(strconv.Itoa(Serv))
+	LeaderAdd := "127.0.0.1:900" + LeaderIdReturned
+	conn, error := net.Dial("tcp", LeaderAdd)
+	if error != nil {
+		conn.Close()
+	}
+	reader := bufio.NewReader(conn)
+	//fmt.Println("test: Giving command connection ",conn)
+	io.Copy(conn, bytes.NewBufferString("set key71 500 2\r\ntj\r\n"))
+	res, err := reader.ReadBytes('\n')
+	//fmt.Println("test:  Response: ",res,"connection ",conn )
+	if err != nil {
+		conn.Close()
+	} else {
+		if strings.Contains(strings.TrimSpace(string(res)), "OK") {
+			tester <- 1
+		} else {
+			tester <- 0
+		}
+
+	}
+	conn.Close()
 }
 
 //..............................................................................................................................//
@@ -240,7 +309,7 @@ func check_SetnGet(t *testing.T, tester chan bool) {
 		conn.Close()
 	}
 
-	io.Copy(conn, bytes.NewBufferString("set Roll101 50 5\r\nTarun\r\n"))
+	io.Copy(conn, bytes.NewBufferString("set Roll101 50 5\r\nMayur\r\n"))
 	reader := bufio.NewReader(conn)
 	resp, error := reader.ReadBytes('\n')
 	if error != nil {
@@ -273,7 +342,7 @@ func check_SetnGet(t *testing.T, tester chan bool) {
 				conn.Close()
 			} else {
 
-				if res == "Tarun\r\n" {
+				if res == "Mayur\r\n" {
 					tester <- true
 					conn.Close()
 				} else {
@@ -655,6 +724,7 @@ func check_SetnCas(t *testing.T, tester chan bool) {
 	} else {
 		resp := strings.TrimRight(string(res), "\r\n")
 		response := strings.Split(strings.TrimSpace(resp), " ")
+
 		if len(response) == 4 && response[0] == "VALUE" && response[1] == "1" {
 			res, err = reader.ReadBytes('\n')
 			if err != nil && string(res) != "Akash\r\n" {
@@ -737,7 +807,6 @@ func check_SetnDel(t *testing.T, tester chan bool) {
 
 	conn.Close()
 }
-
 /*
 //..............................................................................................................................//
 
@@ -748,8 +817,8 @@ func check_SetnDel(t *testing.T, tester chan bool) {
 func TestMulticlient(t *testing.T) {
 
 	tester := make(chan int)
-        Serv := returnRandServ()
-        LeaderIdReturned := get_LeaderId(strconv.Itoa(Serv))
+	Serv := returnRandServ()
+	LeaderIdReturned := get_LeaderId(strconv.Itoa(Serv))
 	for i := 0; i < noOfThreads; i++ {
 		go multiclient(t, tester, LeaderIdReturned)
 	}
@@ -768,7 +837,7 @@ func TestMulticlient(t *testing.T) {
 
 func multiclient(t *testing.T, tester chan int, LeaderIdReturned string) {
 
-        //Serv := returnRandServ()
+	//Serv := returnRandServ()
 	//LeaderIdReturned := get_LeaderId(strconv.Itoa(Serv))
 	LeaderAdd := "127.0.0.1:900" + LeaderIdReturned
 	conn, error := net.Dial("tcp", LeaderAdd)
@@ -790,9 +859,7 @@ func multiclient(t *testing.T, tester chan int, LeaderIdReturned string) {
 	}
 	conn.Close()
 }
-
 */
-
 //..............................................................................................................................//
 
 // Testcase to test Basic Set and Get (checking log replication, using server killing)
@@ -929,7 +996,7 @@ func check_SetnGetKill(t *testing.T, tester chan bool) {
 func TestLeaderElect2(t *testing.T) {
 
 	tester := make(chan bool)
-	time.Sleep(time.Second * 2)
+	time.Sleep(time.Second * 6)
 	go check_LeaderElect2(t, tester)
 	check := <-tester
 
@@ -954,6 +1021,7 @@ func check_LeaderElect2(t *testing.T, tester chan bool) {
 	Serv1 := returnRandServ()
 	killServer(Serv1)
 	//fmt.Println(Serv1)
+	
 	Serv2 := returnRandServ()
 	//time.Sleep(time.Second * 2)
 	//fmt.Println(Serv2)
@@ -994,23 +1062,23 @@ func check_LeaderElect2(t *testing.T, tester chan bool) {
 
 }
 
+
 //..............................................................................................................................//
 
 // Testcase to test Basic Set and Get (checking log replication, using server killing)
 
 //..............................................................................................................................//
-
-func TestSetnGetKillMajority(t *testing.T) {
-
+func TestSetnGetKillMajorityServers(t *testing.T) {
+time.Sleep(time.Second * 6)
 	tester := make(chan bool)
 	go check_SetnGetKillMajority(t, tester)
 	check := <-tester
 
 	if !check {
-		t.Error("SetnGetKillMajority Failed, please check implementation")
+		t.Error("TestSetnGetKillMajorityServers Failed, please check implementation")
 	} else {
 
-		fmt.Println("Testcase - TestSetnGetKillMajority : Passed")
+		fmt.Println("Testcase - TestSetnGetKillMajorityServers : Passed")
 	}
 }
 
@@ -1048,25 +1116,165 @@ func check_SetnGetKillMajority(t *testing.T, tester chan bool) {
 
 	}
 
+	//First Leader killed
 	killServer(LeaderId)
-
+fmt.Println("Killed server ",LeaderId)
+	
+	//Second leader killed
 	Serv1 := returnRandServ()
 	LeaderIdReturned1 := get_LeaderId(strconv.Itoa(Serv1))
 	LeaderId1, _ := strconv.Atoi(LeaderIdReturned1)
 	killServer(LeaderId1)
-
+	fmt.Println("Killed server ",LeaderId1)
+	//Third leader killed
 	Serv2 := returnRandServ()
 	LeaderIdReturned2 := get_LeaderId(strconv.Itoa(Serv2))
 	LeaderId2, _ := strconv.Atoi(LeaderIdReturned2)
 	killServer(LeaderId2)
-
 	//go restartServerAfterSomeTime(LeaderId2)
+fmt.Println("Killed server ",LeaderId2)
+	go restartServerAfterSomeTime(LeaderId)
 
 	Serv3 := returnRandServ()
 	LeaderIdReturned3 := get_LeaderId(strconv.Itoa(Serv3))
-	//LeaderId3,_ := strconv.Atoi(LeaderIdReturned2)
-	//killServer(LeaderId2)
+	//LeaderId3, _ := strconv.Atoi(LeaderIdReturned2)
+	
+	
+	
+	LeaderAdd = "127.0.0.1:900" + LeaderIdReturned3
+	conn1, error := net.Dial("tcp", LeaderAdd)
+	if error != nil {
+		tester <- false
+		conn1.Close()
+	}
 
+	//fmt.Println("Dialed server : ",LeaderAdd)
+	io.Copy(conn1, bytes.NewBufferString("get key51\r\n"))
+	reader = bufio.NewReader(conn1)
+	resp, error = reader.ReadBytes('\n')
+	if error != nil {
+		conn1.Close()
+	} else {
+		response := strings.Split(strings.TrimSpace(string(resp)), " ")
+		if response[0] == "VALUE" || response[1] == "5" {
+
+			res, error := reader.ReadString('\n')
+			if error != nil {
+				conn1.Close()
+			} else {
+
+				if res == "Tarun\r\n" {
+					tester <- true
+					conn1.Close()
+				} else {
+					tester <- false
+					conn1.Close()
+				}
+
+			}
+
+		} else {
+			tester <- false
+			conn1.Close()
+		}
+
+	}
+
+	//wgroup.Add(1)
+	go execute_cmd(LeaderId1) //restarting the killed servers
+
+	//wgroup.Add(1)
+	go execute_cmd(LeaderId2) //restarting the killed servers
+	//time.Sleep(time.Second * 2)
+
+	//tester <- true
+	//wgroup.Wait()
+	conn1.Close()
+}
+
+//..............................................................................................................................//
+
+// Testcase to test Basic Set and Get functionality after killing any 3 random servers, this will also tests if log replication have been done properly or not along with leader election, in case leader is one of the random server chosen to be killed.
+
+//..............................................................................................................................//
+
+func TestSetnGetKillRandomServers(t *testing.T) {
+
+	tester := make(chan bool)
+	time.Sleep(time.Second * 6)
+	go check_SetnGetKillRandomServers(t, tester)
+	check := <-tester
+
+	if !check {
+		t.Error("TestSetnGetKillRandomServers Failed, please check implementation")
+	} else {
+
+		fmt.Println("Testcase - TestSetnGetKillRandomServers : Passed")
+	}
+}
+
+
+func check_SetnGetKillRandomServers(t *testing.T, tester chan bool) {
+
+	Serv := returnRandServ()
+
+	LeaderIdReturned := get_LeaderId(strconv.Itoa(Serv))
+	//fmt.Println("hi ",LeaderIdReturned)
+	strconv.Atoi(LeaderIdReturned)
+	LeaderAdd := "127.0.0.1:900" + LeaderIdReturned
+	conn, error := net.Dial("tcp", LeaderAdd)
+	if error != nil {
+		tester <- false
+		conn.Close()
+	}
+
+	io.Copy(conn, bytes.NewBufferString("set key51 50 5\r\nTarun\r\n"))
+	reader := bufio.NewReader(conn)
+	resp, error := reader.ReadBytes('\n')
+	if error != nil {
+		conn.Close()
+	} else {
+		if len(string(resp)) > 0 {
+			response := strings.Split(strings.TrimSpace(string(resp)), " ")
+			if response[0] != "OK" {
+				tester <- false
+				conn.Close()
+			}
+
+		} else {
+			tester <- false
+			conn.Close()
+		}
+
+	}
+
+	server1 := returnRandServ()
+	killServer(server1)
+
+	fmt.Println("Killed1 ",server1)
+
+	//var server2,server3 int
+	
+		  server2 := returnRandServ()
+	 killServer(server2)
+	 //fmt.Println("chosen2 ",server2)
+	 
+	fmt.Println("Killed2 ",server2)
+	
+	
+		  server3 := returnRandServ()
+	killServer(server3)
+	
+fmt.Println("Killed3 ",server3)
+
+
+	go restartServerAfterSomeTime(server1)
+
+	Serv3 := returnRandServ()
+	LeaderIdReturned3 := get_LeaderId(strconv.Itoa(Serv3))
+	//LeaderId3, _ := strconv.Atoi(LeaderIdReturned2)
+
+	
 	LeaderAdd = "127.0.0.1:900" + LeaderIdReturned3
 	conn1, error := net.Dial("tcp", LeaderAdd)
 	if error != nil {
@@ -1106,10 +1314,10 @@ func check_SetnGetKillMajority(t *testing.T, tester chan bool) {
 	}
 
 	//wgroup.Add(1)
-	go execute_cmd(LeaderId) //restarting the killed servers
+	go execute_cmd(server2) //restarting the killed servers
 
 	//wgroup.Add(1)
-	go execute_cmd(LeaderId1) //restarting the killed servers
+	go execute_cmd(server3) //restarting the killed servers
 	//time.Sleep(time.Second * 2)
 
 	//tester <- true
@@ -1117,9 +1325,22 @@ func check_SetnGetKillMajority(t *testing.T, tester chan bool) {
 	conn1.Close()
 }
 
+func TestKillAllServers(t *testing.T) {
+cmd := exec.Command("pkill", "kvstore")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	if err != nil {
+		t.Log(err)
+	}
+	cmd.Wait()	
+
+}
 func restartServerAfterSomeTime(LeaderId2 int) {
 
 	time.Sleep(time.Second * 6)
 	go execute_cmd(LeaderId2)
+
+	fmt.Println("Restarting ", LeaderId2)
 
 }
