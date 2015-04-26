@@ -22,7 +22,7 @@ func main() {
 
 	raft.MsgAckMap = make(map[raft.Lsn]int)
 	raft.LogEntMap = make(map[raft.Lsn]net.Conn)
-	raft.CommitCh = make(chan raft.LogEntryStruct)
+	raft.CommitCh = make(chan raft.ConMsg)
 
 	// heap implementation to delete expired keys
 	heap.Init(&(raft.PQ))
