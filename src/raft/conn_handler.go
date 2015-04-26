@@ -4,13 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/gob"
-	//"fmt"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
+	//"time"
 )
 
 //var AtomicAppend chan int
@@ -22,7 +22,7 @@ type Keyvalstore interface {
 	parseSetCas(cmdtype int, res []string, conn net.Conn)
 
 	parseRest(cmdtype int, res []string, conn net.Conn)
-	AppendUtility(conn net.Conn, command *bytes.Buffer)
+	AppendUtility(conn net.Conn, command *bytes.Buffer, commandData *Command)
 
 	ConnHandler(conn net.Conn)
 }
@@ -36,7 +36,9 @@ func (ServerVar *Raft) ClientServerComm(clientPortAddr string) {
 	if error != nil {
 		panic("Client-Server connection error : " + error.Error())
 	}
-
+	//fmt.Println("State machine Apply ----- : ", ServerVar.ServId())
+	go ServerVar.ApplyCommandToSM()
+	go KvReadCommitCh()
 	for {
 
 		con, error := lis.Accept()
@@ -44,8 +46,9 @@ func (ServerVar *Raft) ClientServerComm(clientPortAddr string) {
 			panic("Client-Server accept error : " + error.Error())
 			continue
 		}
+
 		go ServerVar.ConnHandler(con)
-		go KvReadCommitCh()
+
 	}
 
 }
@@ -109,8 +112,9 @@ func (ServerVar *Raft) parseSetCas(cmdtype int, res []string, conn net.Conn, rea
 		encCommand := gob.NewEncoder(command)
 		encCommand.Encode(commandData)
 
-		MutexAppend.Lock()
-		ServerVar.AppendUtility(conn, command)
+		//MutexAppend.Lock()
+		ServerVar.Inprocess = true
+		ServerVar.AppendUtility(conn, command, commandData)
 
 	}
 
@@ -118,36 +122,85 @@ func (ServerVar *Raft) parseSetCas(cmdtype int, res []string, conn net.Conn, rea
 
 //AppendUtility() calls append() periodically after every 3 seconds for infinite time until consensus is reached among servers.
 // Once concenus is arrived,it will return.
-func (ServerVar *Raft) AppendUtility(conn net.Conn, command *bytes.Buffer) {
+func (ServerVar *Raft) AppendUtility(conn net.Conn, command *bytes.Buffer, commandData Command) {
+	//var LogEnt LogEntry
 
-	ticker := time.NewTicker(3 * time.Second)
+	if debug {
+		fmt.Println("SERVERINFO: I am ", ServerVar.ServId(), "And leader is ", ServerVar.GetLeader())
+	}
+	var err ErrRedirect
+	if ServerVar.GetState() != LEADER {
 
-	go func() {
-		for {
-			les, er := ServerVar.Append(command.Bytes())
+		//fmt.Println("Last Index for log is ", ServerVar.SLog.lastIndex())
+		err = ErrRedirect(ServerVar.GetLeader())
 
-			if er == nil {
-				UpdateGlobLogEntMap(les, conn)
-			} else {
-				returnmsg := er.Error()
+		returnmsg := err.Error()
+		conn.Write([]byte(returnmsg))
+		return
 
-				conn.Write([]byte(returnmsg))
-				return
+	}
 
-			}
-			select {
-			case <-ServerVar.GotConsensus:
+	//fmt.Println("Append() This seems leader ", ServerVar.ServId())
 
-				ticker.Stop()
-				return
-			}
-			<-ticker.C
+	var les LogEntryStruct
+	//DO i need +1??
+	//(*ServerVar).LsnVar = (*ServerVar).LsnVar + 1
+	les.Logsn = Lsn(ServerVar.SLog.lastIndex() + 1)
+	les.DataArray = command.Bytes()
+	les.TermIndex = ServerVar.GetTerm()
+	les.Commit = nil
+
+	var msg appendEntries
+
+	msg.TermIndex = ServerVar.Term
+
+	msg.Entries = append(msg.Entries, &les)
+
+	//fmt.Println("appendutility() Term index -----> ",ServerVar.Term)
+
+	var envVar Envelope
+	envVar.Pid = BROADCAST
+	//TODO
+	envVar.MessageId = APPENDENTRIES //APPRIESRPC
+	envVar.Leaderid = ServerVar.LeaderId
+	envVar.SenderId = ServerVar.ServId()
+	envVar.LastLogIndex = ServerVar.SLog.lastIndex()
+	envVar.LastLogTerm = ServerVar.SLog.lastTerm()
+	envVar.CommitIndex = ServerVar.SLog.commitIndex
+
+	envVar.Message = msg
+	MsgAckMap[les.Lsn()] = 1
+
+	//TODO send command on outchan->done
+
+	response := make(chan bool)
+	temp := &CommandTuple{Com: command.Bytes(), ComResponse: response}
+
+	ServerVar.Outchan <- temp
+
+	//ServerVar.Outbox() <- &envVar
+
+	UpdateGlobLogEntMap(les, conn)
+
+	//fmt.Println("Append() lsn = ", les.Logsn)
+
+	select {
+	case t := <-response:
+		if t {
+			CommitCh <- les
+			//delete(MsgAckMap, les.Lsn())
+
+		} else {
+
+			returnmsg := "ERR_INTERNAL\r\n"
+			conn.Write([]byte(returnmsg))
 
 		}
-	}()
+	}
 
 }
 
+//Stores where to send reply for perticular log entry
 func UpdateGlobLogEntMap(les LogEntry, conn net.Conn) {
 
 	MutexLog.Lock()
@@ -162,6 +215,8 @@ func UpdateGlobLogEntMap(les LogEntry, conn net.Conn) {
 
 func (ServerVar *Raft) parseRest(cmdtype int, res []string, conn net.Conn, reader *bufio.Reader) {
 
+	//fmt.Println("Server ID ", ServerVar.ServId(), "parseRest()")
+
 	if len(res) != 2 {
 		returnmsg := "ERRCMDERR\r\n"
 		conn.Write([]byte(returnmsg))
@@ -171,8 +226,9 @@ func (ServerVar *Raft) parseRest(cmdtype int, res []string, conn net.Conn, reade
 		encCommand := gob.NewEncoder(command)
 		encCommand.Encode(commandData)
 
-		MutexAppend.Lock()
-		ServerVar.AppendUtility(conn, command)
+		//MutexAppend.Lock()
+		ServerVar.Inprocess = true
+		ServerVar.AppendUtility(conn, command, commandData)
 
 	}
 }
@@ -186,7 +242,7 @@ func (ServerVar *Raft) ConnHandler(conn net.Conn) {
 		//......Reading command from the clients........
 
 		cmd, err := reader.ReadBytes('\n')
-
+		//fmt.Println("Server ID ", ServerVar.ServId(), "Reading commands connhandler()")
 		var returnmsg string
 		if err == io.EOF {
 			returnmsg = "ERR_INTERNAL\r\n"

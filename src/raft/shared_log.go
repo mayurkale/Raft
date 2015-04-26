@@ -1,42 +1,17 @@
 package raft
 
 import (
-	
 	"fmt"
 	"strconv"
-	"sync"
+	//"sync"
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
-	"errors"	
+	"errors"
 	"github.com/syndtr/goleveldb/leveldb"
-	
 )
 
-type ErrRedirect int // See Log.Append. Implements Error interface.
-
-var MsgAckMap map[Lsn]int
-
-var (
-	errNoCommand       = errors.New("no command")
-	errWrongIndex      = errors.New("bad index")
-	errWrongTerm       = errors.New("bad term")
-	errTermIsSmall     = errors.New("term is too small")
-	errIndexIsSmall    = errors.New("index is too small")
-	errIndexIsBig      = errors.New("commit index is too big")
-	errChecksumInvalid = errors.New("checksum invalid")
-)
-
-type Log struct {
-	sync.RWMutex
-	ApplyFunc   func(*LogEntryStruct)
-	db          *leveldb.DB
-	entries     []*LogEntryStruct
-	commitIndex uint64
-	initialTerm uint64
-}
-
-// create new log
+// create new log object which will stay with server for life
 func createNewLog(dbPath string) *Log {
 	db, err := leveldb.OpenFile(dbPath, nil)
 	if err != nil {
@@ -48,7 +23,29 @@ func createNewLog(dbPath string) *Log {
 		commitIndex: 0,
 		initialTerm: 0,
 	}
-	l.FirstRead()
+
+	iter := l.db.NewIterator(nil, nil)
+	count := 0
+//Reading existing log from DB
+	for iter.Next() {
+		count++
+		entry := new(LogEntryStruct)
+		value := iter.Value()
+		b := bytes.NewBufferString(string(value))
+		dec := gob.NewDecoder(b)
+		err := dec.Decode(entry)
+		if err != nil {
+			panic(fmt.Sprintf("decode:", err))
+		}
+		if uint64(entry.Logsn) > 0 {
+		
+			l.entries = append(l.entries, entry)
+			if uint64(entry.Logsn) <= l.commitIndex {
+				l.ApplyFunc(entry)
+			}
+		}
+	}
+	iter.Release()
 	return l
 }
 
@@ -91,34 +88,7 @@ func (l *Log) getEntry(index uint64) *LogEntryStruct {
 	return l.entries[index-1]
 }
 
-//read all enteries from disk when log intialized
-func (l *Log) FirstRead() error {
-	iter := l.db.NewIterator(nil, nil)
-	count := 0
-	for iter.Next() {
-		count++
-		entry := new(LogEntryStruct)
-		value := iter.Value()
-		b := bytes.NewBufferString(string(value))
-		dec := gob.NewDecoder(b)
-		err := dec.Decode(entry)
-		if err != nil {
-			panic(fmt.Sprintf("decode:", err))
-		}
-		if uint64(entry.Logsn) > 0 {
-			// Append entry.
-			l.entries = append(l.entries, entry)
-			if uint64(entry.Logsn) <= l.commitIndex {
-				l.ApplyFunc(entry)
-			}
-		}
-	}
-	iter.Release()
-	err := iter.Error()
-	return err
-}
-
-//It will return the entries after the given index
+//Below code returns entries after the given index
 func (l *Log) entriesAfter(index uint64, maxLogEntriesPerRequest uint64) ([]*LogEntryStruct, uint64) {
 	l.RLock()
 	defer l.RUnlock()
@@ -126,11 +96,11 @@ func (l *Log) entriesAfter(index uint64, maxLogEntriesPerRequest uint64) ([]*Log
 		return nil, 0
 	}
 	if index > (uint64(len(l.entries))) {
-		panic(fmt.Sprintf("raft: Index is beyond end of log: %v %v", len(l.entries), index))
+		panic(fmt.Sprintf("RAFT: END OF LOG REACHED: %v %v", len(l.entries), index))
 	}
 	pos := 0
 	lastTerm := uint64(0)
-	
+
 	for ; pos < len(l.entries); pos++ {
 		if uint64(l.entries[pos].Logsn) > index {
 			break
@@ -139,13 +109,14 @@ func (l *Log) entriesAfter(index uint64, maxLogEntriesPerRequest uint64) ([]*Log
 	}
 	a := l.entries[pos:]
 	if len(a) == 0 {
+
 		return []*LogEntryStruct{}, lastTerm
 	}
-	//if entries are less then max limit then return all entries
+	//return all entries
 	if uint64(len(a)) < maxLogEntriesPerRequest {
 		return closeResponseChannels(a), lastTerm
 	} else {
-		//otherwise return only max no of enteries premitted
+		//return only max no of enteries premitted
 		return a[:maxLogEntriesPerRequest], lastTerm
 	}
 }
@@ -156,20 +127,25 @@ func closeResponseChannels(a []*LogEntryStruct) []*LogEntryStruct {
 	for i, entry := range a {
 		stripped[i] = &LogEntryStruct{
 			Logsn:     entry.Logsn,
-			TermIndex:      entry.TermIndex,
-			DataArray:   entry.DataArray,
-			Commit : nil,
+			TermIndex: entry.TermIndex,
+			DataArray: entry.DataArray,
+			Commit:    nil,
 		}
 	}
 	return stripped
 }
 
-//Return the last log entry term
+//Returns the last log entry term
 func (l *Log) lastTerm() uint64 {
 	l.RLock()
 	defer l.RUnlock()
-	return l.lastTermWithOutLock()
+	if len(l.entries) <= 0 {
+		return 0
+	}
+	return uint64(l.entries[len(l.entries)-1].TermIndex)
 }
+
+
 func (l *Log) lastTermWithOutLock() uint64 {
 	if len(l.entries) <= 0 {
 		return 0
@@ -181,10 +157,16 @@ func (l *Log) lastTermWithOutLock() uint64 {
 func (l *Log) discardEntries(index, term uint64) error {
 	l.Lock()
 	defer l.Unlock()
+
+	//fmt.Println("SERVER In discard entry")
 	if index > l.lastIndexWithOutLock() {
 		return errIndexIsBig
 	}
+	if debug {
+	fmt.Println("ERROR ", index, "  ", l.getCommitIndexWithOutLock())
+	}
 	if index < l.getCommitIndexWithOutLock() {
+
 		return errIndexIsSmall
 	}
 	if index == 0 {
@@ -201,10 +183,10 @@ func (l *Log) discardEntries(index, term uint64) error {
 		// Do not discard if the entry at index does not have the matching term.
 		entry := l.entries[index-1]
 		if len(l.entries) > 0 && uint64(entry.TermIndex) != term {
-			return errors.New(fmt.Sprintf("raft.Log: Entry at index does not have matching term (%v): (IDX=%v, TERM=%v)", entry.TermIndex, index, term))
+			return errors.New(fmt.Sprintf("RAFT.SLog: Entry at index does not have matching term (%v): (IDX=%v, TERM=%v)", entry.TermIndex, index, term))
 		}
 		// Otherwise discard up to the desired entry.
-		
+
 		if index < uint64(len(l.entries)) {
 			buf := make([]byte, 8)
 			// notify clients if this node is the previous leader
@@ -231,11 +213,13 @@ func (l *Log) discardEntries(index, term uint64) error {
 func (l *Log) getCommitIndex() uint64 {
 	l.RLock()
 	defer l.RUnlock()
-	return l.getCommitIndexWithOutLock()
-}
-func (l *Log) getCommitIndexWithOutLock() uint64 {
 	return l.commitIndex
 }
+
+func (l *Log) getCommitIndexWithOutLock() uint64{
+return l.commitIndex
+}
+
 
 //Return lastlog entry index
 func (l *Log) lastIndex() uint64 {
@@ -283,6 +267,11 @@ func (l *Log) appendEntry(entry *LogEntryStruct) error {
 		return err
 	}
 	l.entries = append(l.entries, entry)
+
+	//fmt.Println("SERVER Appending LSN = ",entry.Logsn,"term,index,commitIndex  ",l.lastTerm(),l.lastIndex(),l.commitIndex)
+	if debug {
+	fmt.Println("SERVER Appending LSN = ", entry.Logsn)
+	}
 	return nil
 }
 
@@ -315,7 +304,9 @@ func (l *Log) commitTill(commitIndex uint64) error {
 		// Update commit index.
 		l.commitIndex = uint64(entry.Logsn)
 		if entry.Commit != nil {
+			//fmt.Println("Giving true........")
 			entry.Commit <- true
+
 			close(entry.Commit)
 			entry.Commit = nil
 		} else {
@@ -362,7 +353,7 @@ type SharedLog interface {
 	// and returns without waiting for the result.
 
 	ClusterComm()
-	Append(data []byte) (LogEntry, error)
+	Append(data []byte, commandData Command) (LogEntry, error)
 }
 
 //Envelop packs message along with server id and message id.
@@ -371,32 +362,6 @@ type SharedLog interface {
 2 => Message is ACK from Peers
 
 */
-
-type Envelope struct {
-	Pid          int
-	SenderId     int
-	Leaderid     int
-	MessageId    int
-	CommitIndex  uint64
-	LastLogIndex uint64
-	LastLogTerm  uint64
-	//Message      LogEntryStruct
-	Message interface{}
-}
-
-type LogEntry interface {
-	Lsn() Lsn
-	Data() []byte
-	Term() uint64
-	Committed() bool
-}
-
-type LogEntryStruct struct {
-	Logsn     Lsn
-	TermIndex uint64
-	DataArray []byte
-	Commit    chan bool
-}
 
 func (les LogEntryStruct) Term() uint64 {
 	return les.TermIndex
@@ -411,7 +376,7 @@ func (les LogEntryStruct) Data() []byte {
 }
 
 func (les LogEntryStruct) Committed() bool {
-	return <- les.Commit
+	return <-les.Commit
 }
 
 func (e ErrRedirect) Error() string {
@@ -433,7 +398,7 @@ func AppendEntriesRPC(Servid int, ServerVar *Raft) {
 //Append() Will first check if current server is leader, if not it'll return an error
 //else it'll broadcast to peers in cluster a request for consensus.
 
-func (ServerVar *Raft) Append(data []byte) (LogEntry, error) {
+func (ServerVar *Raft) Append(data []byte, commandData Command) (LogEntry, error) {
 
 	var LogEnt LogEntry
 
@@ -441,16 +406,16 @@ func (ServerVar *Raft) Append(data []byte) (LogEntry, error) {
 	if ServerVar.GetState() != LEADER {
 		err = ErrRedirect(ServerVar.GetLeader())
 
-		fmt.Println("THis is not leader ", ServerVar.ServId())
-		fmt.Println("GetLeader  = ", ServerVar.GetLeader())
-		MutexAppend.Unlock()
+		//fmt.Println("THis is not leader ", ServerVar.ServId())
+		//fmt.Println("GetLeader  = ", ServerVar.GetLeader())
+		//MutexAppend.Unlock()
 		//unlock the MutexAppend Call lock
 		return LogEnt, err
 	}
 
-	fmt.Println("THis seems leader ", ServerVar.ServId())
-	fmt.Println("GetLeader  = ", ServerVar.GetLeader())
-	fmt.Println("GetState  = ", ServerVar.GetState())
+	//fmt.Println("Append() This seems leader ", ServerVar.ServId())
+	//fmt.Println("GetLeader  = ", ServerVar.GetLeader())
+	//fmt.Println("GetState  = ", ServerVar.GetState())
 
 	var les LogEntryStruct
 
@@ -471,12 +436,17 @@ func (ServerVar *Raft) Append(data []byte) (LogEntry, error) {
 	var envVar Envelope
 	envVar.Pid = BROADCAST
 	//TODO
-	envVar.MessageId = APPENDENTRIESRPC //APPRIESRPC
+	envVar.MessageId = APPENDENTRIES //APPRIESRPC
+	envVar.Leaderid = ServerVar.LeaderId
 	envVar.SenderId = ServerVar.ServId()
 	envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
 	envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
 	envVar.Message = msg
 	MsgAckMap[les.Lsn()] = 1
+
+	//TODO send command on outchan->done
+	ServerVar.Outchan <- commandData
+
 	ServerVar.Outbox() <- &envVar
 	//fmt.Println("Server...........  1")
 

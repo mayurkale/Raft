@@ -4,55 +4,12 @@ import (
 	"bytes"
 	"container/heap"
 	"encoding/gob"
-	"net"
+	"fmt"
+	//"net"
 	"strconv"
-	"sync"
+	//"sync"
 	"time"
 )
-
-//Map to maintain log-entry to client conn mapping, used while sending back response to client
-var LogEntMap map[Lsn]net.Conn
-
-//CommitCh channel is used by sharedlog, to put commited Command entry onto channel for kvstore to execute
-var CommitCh chan LogEntryStruct
-
-//Map for Key value store
-var keyval = make(map[string]valstruct)
-
-//Locks Used
-var mutex = &sync.RWMutex{}    //Lock for keyval store
-var MutexLog = &sync.RWMutex{} //Lock for LogEntMap store
-
-//Structure to store the value for each key
-type valstruct struct {
-	version    int64
-	expirytime int
-	timestamp  int64
-	numbytes   int
-	value      []byte
-}
-
-//Structure to store the parsed command sent by the client to connhandler
-type Command struct {
-	CmdType    int // 1-set , 2-cas, 3-get , 4-getm , 5-delete
-	Key        string
-	Expirytime int
-	Len        int
-	Value      []byte
-	Version    int64
-}
-
-//Heap(Priority Queue Implementation) -- code functions taken from Golang ducumentation examples and edited
-var PQ = make(PriorityQueue, 0)
-
-type Item struct {
-	value     string // The value of the item; arbitrary.
-	priority  int64  // The priority of the item in the queue.
-	timestamp int64  // To ensure unique element insert in heap (helps in deleting/updating elements)
-	index     int    // The index of the item in the heap.
-}
-
-type PriorityQueue []*Item
 
 func (PQ PriorityQueue) Len() int { return len(PQ) }
 
@@ -84,52 +41,98 @@ func (PQ *PriorityQueue) Pop() interface{} {
 	return item
 }
 
+//Fuction to to apply old entries to state machine
+func (ServerVar *Raft) ApplyCommandToSM() {
+	for {
+		//fmt.Println("State machine Apply entered Server ID : ", ServerVar.ServId())
+		les := <-ServerVar.Inchan
+		//fmt.Println("State machine Apply listened Server ID : ", ServerVar.ServId())
+
+		var decoddata Command
+		cmddcd := bytes.NewBuffer(les.DataArray)
+		cmd := gob.NewDecoder(cmddcd)
+		cmd.Decode(&decoddata)
+
+if debug {
+		fmt.Println("Server ID : ", ServerVar.ServId(), "  Applying command : ", decoddata.CmdType, "Key = ", decoddata.Key)
+}
+		switch decoddata.CmdType {
+
+		case 1:
+			_ = SetCmdReturn(decoddata)
+			break
+		case 2:
+			_ = CasCmdReturn(decoddata)
+			break
+		/*case 3:
+			_ = GetCmdReturn(decoddata)
+			break
+		case 4:
+			_ = GetMCmdReturn(decoddata)
+			break*/
+		case 5:
+			_ = DeleteCmdReturn(decoddata)
+			break
+
+		default:
+			_ = "ERRCMDERR\r\n"
+			break
+		}
+	}
+
+}
+
 //Fuction to read command from CommitCh channel and process
 func KvReadCommitCh() {
 
 	for {
 		les := <-CommitCh
-		
-		if <-les.Commit {
 
-			var decoddata Command
-			cmddcd := bytes.NewBuffer(les.DataArray)
-			cmd := gob.NewDecoder(cmddcd)
-			cmd.Decode(&decoddata)
+		var decoddata1 Command
+		cmddcd1 := bytes.NewBuffer(les.DataArray)
+		cmd1 := gob.NewDecoder(cmddcd1)
+		cmd1.Decode(&decoddata1)
 
-			var ret string
+//		fmt.Println("Got for commitch ", decoddata1.CmdType, " key = ", decoddata1.Key, "LSN = ", les.Logsn)
 
-			switch decoddata.CmdType {
-			case 1:
-				ret = SetCmdReturn(decoddata)
-				break
-			case 2:
-				ret = CasCmdReturn(decoddata)
-				break
-			case 3:
-				ret = GetCmdReturn(decoddata)
-				break
-			case 4:
-				ret = GetMCmdReturn(decoddata)
-				break
-			case 5:
-				ret = DeleteCmdReturn(decoddata)
-				break
+		var decoddata Command
+		cmddcd := bytes.NewBuffer(les.DataArray)
+		cmd := gob.NewDecoder(cmddcd)
+		cmd.Decode(&decoddata)
 
-			default:
-				ret = "ERRCMDERR\r\n"
-				break
-			}
+		var ret string
 
-			//Lock and unlock Logentry-client Map
-			MutexLog.RLock()
-			conn, _ := LogEntMap[les.Logsn] // conn is connection object to respond back to respective client
-			MutexLog.RUnlock()
+		switch decoddata.CmdType {
+		case 1:
+			ret = SetCmdReturn(decoddata)
+			break
+		case 2:
+			ret = CasCmdReturn(decoddata)
+			break
+		case 3:
+			ret = GetCmdReturn(decoddata)
 
-			//Response to client based on type of statement
-			conn.Write([]byte(ret))
+			break
+		case 4:
+			ret = GetMCmdReturn(decoddata)
+			break
+		case 5:
+			ret = DeleteCmdReturn(decoddata)
+			break
 
+		default:
+			ret = "ERRCMDERR\r\n"
+			break
 		}
+
+		//Lock and unlock Logentry-client Map
+		MutexLog.RLock()
+		conn, _ := LogEntMap[les.Logsn] // conn is connection object to respond back to respective client
+		MutexLog.RUnlock()
+
+		//Response to client based on type of statement
+		conn.Write([]byte(ret))
+
 	}
 
 }
@@ -221,6 +224,7 @@ func GetCmdReturn(CommandData Command) string {
 
 		returnmsg = "ERRNOTFOUND\r\n"
 	}
+
 	return returnmsg
 }
 

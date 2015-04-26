@@ -1,21 +1,16 @@
-#NOTE:
-Assignment is not ready to evaluate yet. I have coded leader election but it's not working properly as of now, will debug code and try to complete code over the upcoming weekend.
 
+# Replicated Key Value Store Using Raft Consenus Algorithm
 
+Raft algorithm have two main stages:
 
+- Leader Election
+- Log Replication
 
+In this implementation, we have developed a replicated key-value store shared by multiple servers, with the help of raft consensus algorithm.
 
+In this architecture, there are multiple server machines containing the replica of the store, which accept commands from the client. One of the replica is elected as a leader using raft consensus algorithm. The client sends the command to the servers, which processes it only if it is the leader. Leader writes command in it's own log and sends append message to peers to get consensus for log entry commit, and once consensus is achieved it writes that command entry in it's own log and asks other peer servers to append log entry to their own log structure.
 
-
-
-# Replicated Key Value Store
-
-In this implementation, we have developed a replicated store shared by multiple servers, with the help of a shared log structure and majority consensus based commit.
-
-In this architecture, there are multiple server machines containing the replica of the store, which accept commands from the client. One of the replica is predefined as a leader. The client sends the command to the servers, which processes it only if it is the leader.
-
-The leader, on receiving the request, sends an append message to the other servers. Then, it waits for acknowledgement from the other servers. If it receives acknowledgement from a majority of the servers, it performs the operation on the Key Value Store and responds to the client.
-
+For details of raft consensus algorithm please go through
 .. (Reference: In Search of an Understandable Consensus Algorithm)
 
 ## Run Instructions:
@@ -37,10 +32,6 @@ bin/kvstore -id=5
 /* Here <server_id> represents id of the server*/
 ```
 
-
-
-
-
 ### Test Instruction:
 Assuming you are at root folder
 Key-Value server can be tested by hitting below command 
@@ -58,48 +49,18 @@ go test -v
 ```
 
 
-## Work Completed
-
-- Implemented basic operations set,get,getm,delete,cas for Key-Value store
-- Handled concurrency using locks
-- Used priority queue(MIN-HEAP) for periodic cleanup of expired key-value pairs
-  using 'container/heap' package
-  
- ( Package heap provides heap operations for any type that implements heap.Interface. 
- A heap is a tree with the property that each node is the minimum-valued node in its subtree.
- A heap is a common way to implement a priority queue. To build a priority queue,
- implement the Heap interface with the (negative) priority as the ordering for the
- Less method, so Push adds items while Pop removes the highest-priority item from
- the queue.The Examples include such an implementation; the file example_pq_test.go
- has the complete source)
-- Implemented multiple replica servers with single predefined leader
-- Implemented connection handler to parse commands and append to shared log
-- Committing on majority consensus
-- Tested code on 
-	1. Functionality for all the basic functions.
-	2. Expiry of key-value pair
-	3. Tested concurrent set operaton by multiple cients and at last validated result by comparing version number
-	4. Stress testing by sending multiple commands from from clients concurrently
-
-
 ## Requirements
 
 - go 1.4.1 and higher
 - zmq 4.1.0
+- goleveldb
 
 ## Features
-
-- Serves more than one million requests in 15 seconds i.e it can handle more than 10000 clients at a time and each client sending 100 requests
 - Automatic garbage collection is performed per 5 seconds and this time is tunable
 - Various commands supported (mentioned in functionalities) which gives best possible functions out of key value store
 - Scalable to addition of servers by modifying configuration file
+- Fault Tolerent: Code can sustain killing of multiple servers (they be leader too).
 
-
-## Known Bugs
-
-- As of now first server in the configuration file is assumed to be leader.
-- Reading the value as a string, instead of byte array.
-- Can perform only one append operation at a time
 
 
 ## Functionalities
@@ -200,3 +161,33 @@ go test -v
     3. "ERRCMDERR\r\n" (the command line is not formatted correctly)
     4. "ERR_INTERNAL\r\n"
     5. "Redirect to server <server>\r\n"
+    
+    
+    
+## Work Completed
+
+- Implemented basic operations set,get,getm,delete,cas for Key-Value store
+- Handled concurrency using locks
+- Used priority queue(MIN-HEAP) for periodic cleanup of expired key-value pairs
+  using 'container/heap' package
+  
+ ( Package heap provides heap operations for any type that implements heap.Interface. 
+ A heap is a tree with the property that each node is the minimum-valued node in its subtree.
+ A heap is a common way to implement a priority queue. To build a priority queue,
+ implement the Heap interface with the (negative) priority as the ordering for the
+ Less method, so Push adds items while Pop removes the highest-priority item from
+ the queue.The Examples include such an implementation; the file example_pq_test.go
+ has the complete source)
+- Implemented multiple replica servers with single predefined leader
+- Implemented connection handler to parse commands and append to shared log
+- Committing on majority consensus
+- Implmented leader election using raft.
+- Implemented shared log using leveldb
+- Tested code on 
+	1. Functionality for all the basic functions.
+	2. Expiry of key-value pair
+	3. Tested concurrent set operaton by multiple cients and at last validated result by comparing version number
+	4. Stress testing by sending multiple commands from from clients concurrently
+	5. Majority servers going down
+	6. Leader going down and subsequent testing to check log replication
+    

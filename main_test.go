@@ -1,29 +1,31 @@
 package main
 
 import (
-	//"bufio"
-	//"bytes"
+	"bufio"
+	"bytes"
 	"encoding/json"
-	//"fmt"
-	//"io"
+	"fmt"
+	"io"
 	"io/ioutil"
 	//"math/rand"
-	//"net"
+	"net"
 	"os"
 	"os/exec"
 	"raft"
 	"strconv"
-	//"strings"
-	"sync"
-	//	"testing"
+	"strings"
+	//"sync"
+	"testing"
 	"time"
 )
 
-var noOfThreads int = 500
+var noOfThreads int = 3
 var noOfRequestsPerThread int = 10
-var wgroup sync.WaitGroup
+
+//var wgroup sync.WaitGroup
 var commands []string
 var procmap map[int]*exec.Cmd
+var servermap map[int]bool
 
 func init() {
 
@@ -47,40 +49,174 @@ func launch_servers() {
 
 	no_servers, _ = strconv.Atoi(obj.Count.Count)
 	procmap = make(map[int]*exec.Cmd)
+	servermap = make(map[int]bool)
 	for i := 1; i <= no_servers; i++ {
-		wgroup.Add(1)
+		//wgroup.Add(1)
 		go execute_cmd(i)
 	}
 
-	wgroup.Wait()
+	//wgroup.Wait()
 
 }
 
 func execute_cmd(id int) {
+
 	//fmt.Println("Server Id = ", id)
+
 	cmd := exec.Command("./bin/kvstore", "-id="+strconv.Itoa(id))
 
+	servermap[id] = true
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
+	//fmt.Println("SErvermap = ", servermap)
 	procmap[id] = cmd
 	err := cmd.Run()
 	if err != nil {
-		wgroup.Done()
+		//wgroup.Done()
 	}
 
 	cmd.Wait()
-	wgroup.Done()
+	//wgroup.Done()
 
+}
+
+/*
+func TestLeaderKill(t *testing.T) {
+
+	slice := []int{3, 4, 5}
+        check := false
+        for _,elem := range slice{
+	if err := procmap[elem].Process.Kill(); err != nil {
+            t.Log("failed to kill: ", err)
+        }
+ 	t.Log("YOOYOYOYOYOMMMMMMMM")
+ 	check = true
+  	wgroup.Done()
+        }
+
+        //wgroup.Add(1)
+	go execute_cmd(3)
+	if err := procmap[3].Process.Kill(); err != nil {
+            t.Log("failed to kill: ", err)
+
+        } else {
+          check = true
+        }
+
+	if !check {
+		t.Error("TestLeaderElect1 Failed, please check implementation")
+	} else {
+
+		fmt.Println("Testcase - TestLeaderElect1 : Passed")
+	}
+}
+
+*/
+
+//-------------------------------------------------------------------------------------------------------------------
+// Helper function to get the ServerId of current leader, using ping to a random server
+//------------------------------------------------------------------------------------------------------------------
+func get_LeaderId(pingServId string) string {
+	//fmt.Println("in leader  ")
+	ServAdd := "127.0.0.1:900" + pingServId
+	conn, _ := net.Dial("tcp", ServAdd)
+	//fmt.Println("conn established  ")
+	//time.Sleep(5 * time.Second)
+	//fmt.Println("before re  ")
+	reader := bufio.NewReader(conn)
+	//fmt.Println("after re  ")
+	leaderId := "-1"
+	for leaderId == "-1" {
+		//fmt.Println("in loop  ")
+		io.Copy(conn, bytes.NewBufferString("get leaderId\r\n"))
+
+		resp, _ := reader.ReadBytes('\n')
+		//fmt.Println("resd bytes  ")
+		response := strings.Split(strings.TrimSpace(string(resp)), " ")
+		//fmt.Println(string(resp))
+
+		if response[0] == "ERRNOTFOUND" {
+			leaderId = pingServId
+		} else if response[0] == "Redirect" && response[3] != "-1" {
+			id, _ := strconv.Atoi(response[3])
+			if _, ok := servermap[id]; ok {
+				leaderId = response[3]
+			}
+		}
+	}
+	conn.Close()
+	return leaderId
+}
+
+func returnRandServ() int {
+
+	for k, v := range servermap {
+		if v == true {
+			return k
+		}
+	}
+	return -1
+}
+
+func killServer(id int) {
+
+	if err1 := procmap[id].Process.Kill(); err1 != nil {
+		fmt.Println("failed to kill: ", err1)
+	} else {
+		delete(servermap, id)
+	}
 }
 
 //..............................................................................................................................//
 
-// Testcase to test basic Set and Get operation
+// Testcase to test Leader Election - 1 (First Leader Elect)
+
+//..............................................................................................................................//
+func TestLeaderElect1(t *testing.T) {
+
+	tester := make(chan bool)
+	go check_LeaderElect1(t, tester)
+	check := <-tester
+
+	if !check {
+		t.Error("TestLeaderElect1 Failed, please check implementation")
+	} else {
+
+		fmt.Println("Testcase - TestLeaderElect1 : Passed")
+	}
+}
+
+func check_LeaderElect1(t *testing.T, tester chan bool) {
+
+	LeaderAdd := "127.0.0.1:900" + get_LeaderId("1")
+	conn, error := net.Dial("tcp", LeaderAdd)
+	if error != nil {
+		tester <- false
+		conn.Close()
+	}
+	io.Copy(conn, bytes.NewBufferString("get LeaderTester\r\n"))
+	reader := bufio.NewReader(conn)
+	resp, error := reader.ReadBytes('\n')
+	if error != nil {
+		conn.Close()
+	} else {
+		response := strings.Split(strings.TrimSpace(string(resp)), " ")
+		if response[0] == "ERRNOTFOUND" {
+			tester <- true
+		} else {
+			tester <- false
+		}
+
+	}
+	conn.Close()
+}
 
 //..............................................................................................................................//
 
-/*
+// Testcase to test Basic Set and Get
+
+//..............................................................................................................................//
+
 func TestSetnGet(t *testing.T) {
 
 	tester := make(chan bool)
@@ -97,23 +233,21 @@ func TestSetnGet(t *testing.T) {
 
 func check_SetnGet(t *testing.T, tester chan bool) {
 
-	conn, error := net.Dial("tcp", "127.0.0.1:9001")
+	LeaderAdd := "127.0.0.1:900" + get_LeaderId("1")
+	conn, error := net.Dial("tcp", LeaderAdd)
 	if error != nil {
 		tester <- false
 		conn.Close()
 	}
 
 	io.Copy(conn, bytes.NewBufferString("set Roll101 50 5\r\nTarun\r\n"))
-
 	reader := bufio.NewReader(conn)
 	resp, error := reader.ReadBytes('\n')
-	//fmt.Println(res)
-	res := string(resp)
 	if error != nil {
 		conn.Close()
 	} else {
-		if len(res) > 0 {
-			response := strings.Split(strings.TrimSpace(res), " ")
+		if len(string(resp)) > 0 {
+			response := strings.Split(strings.TrimSpace(string(resp)), " ")
 			if response[0] != "OK" {
 				tester <- false
 				conn.Close()
@@ -128,15 +262,13 @@ func check_SetnGet(t *testing.T, tester chan bool) {
 
 	io.Copy(conn, bytes.NewBufferString("get Roll101\r\n"))
 	resp, error = reader.ReadBytes('\n')
-	//fmt.Println(res)
-	res = string(resp)
 	if error != nil {
 		conn.Close()
 	} else {
-		response := strings.Split(strings.TrimSpace(res), " ")
+		response := strings.Split(strings.TrimSpace(string(resp)), " ")
 		if response[0] == "VALUE" || response[1] == "5" {
 
-			res, error = reader.ReadString('\n')
+			res, error := reader.ReadString('\n')
 			if error != nil {
 				conn.Close()
 			} else {
@@ -159,8 +291,7 @@ func check_SetnGet(t *testing.T, tester chan bool) {
 	}
 	conn.Close()
 }
-*/
-/*
+
 //..............................................................................................................................//
 
 // Testcase to test basic Set and GetM operation
@@ -181,7 +312,8 @@ func TestSetnGETM(t *testing.T) {
 
 func check_SetnGetM(t *testing.T, tester chan bool) {
 
-	conn, error := net.Dial("tcp", "127.0.0.1:9001")
+	LeaderAdd := "127.0.0.1:900" + get_LeaderId("1")
+	conn, error := net.Dial("tcp", LeaderAdd)
 	if error != nil {
 		tester <- false
 		conn.Close()
@@ -242,7 +374,8 @@ func TestCheckError(t *testing.T) {
 
 func check_error(t *testing.T, tester chan bool) {
 
-	conn, error := net.Dial("tcp", "127.0.0.1:9001")
+	LeaderAdd := "127.0.0.1:900" + get_LeaderId("1")
+	conn, error := net.Dial("tcp", LeaderAdd)
 	if error != nil {
 		tester <- false
 		conn.Close()
@@ -355,7 +488,7 @@ func check_error(t *testing.T, tester chan bool) {
 
 //..............................................................................................................................//
 
-// Testcase: To test error condition of Error-Redirect
+// Testcase: To test error condition of Error-Redirect and all servers redirect to same server  : Leader
 
 //..............................................................................................................................//
 
@@ -374,78 +507,20 @@ func TestCheckErrorRedirect(t *testing.T) {
 
 func check_errorRedirect(t *testing.T, tester chan bool) {
 
-	conn, error := net.Dial("tcp", "127.0.0.1:9002")
-	if error != nil {
-		tester <- false
-		conn.Close()
-	}
-	reader := bufio.NewReader(conn)
+	LeaderId := get_LeaderId("1")
 
-	io.Copy(conn, bytes.NewBufferString("set\r\n"))
-	res, err := reader.ReadBytes('\n')
-	if err != nil || string(res) != "ERRCMDERR\r\n" {
-		tester <- false
-		conn.Close()
-	}
+	slice := []string{"2", "3", "4", "5"}
 
-	io.Copy(conn, bytes.NewBufferString("set key 50 2\r\nab\r\n"))
-	res, err = reader.ReadBytes('\n')
-	if err != nil || string(res) != "Redirect to server 1\r\n" {
-		tester <- false
-		conn.Close()
-	}
-	conn.Close()
+	for _, elem := range slice {
 
-	conn, error = net.Dial("tcp", "127.0.0.1:9003")
-	if error != nil {
-		tester <- false
-		conn.Close()
-	}
-	reader = bufio.NewReader(conn)
+		if LeaderId != get_LeaderId(elem) {
+			tester <- false
+			break
+		} else {
+			tester <- true
+		}
 
-	io.Copy(conn, bytes.NewBufferString("get key\r\n"))
-	res, err = reader.ReadBytes('\n')
-	if err != nil || string(res) != "Redirect to server 1\r\n" {
-		tester <- false
 	}
-	conn.Close()
-
-	conn, error = net.Dial("tcp", "127.0.0.1:9004")
-	if error != nil {
-		tester <- false
-		conn.Close()
-	}
-	reader = bufio.NewReader(conn)
-
-	io.Copy(conn, bytes.NewBufferString("getm key\r\n"))
-	res, err = reader.ReadBytes('\n')
-	if err != nil || string(res) != "Redirect to server 1\r\n" {
-		tester <- false
-	}
-	conn.Close()
-
-	conn, error = net.Dial("tcp", "127.0.0.1:9005")
-	if error != nil {
-		tester <- false
-		conn.Close()
-	}
-	reader = bufio.NewReader(conn)
-
-	io.Copy(conn, bytes.NewBufferString("delete key\r\n"))
-	res, err = reader.ReadBytes('\n')
-	if err != nil || string(res) != "Redirect to server 1\r\n" {
-		tester <- false
-		conn.Close()
-	}
-
-	io.Copy(conn, bytes.NewBufferString("cas ROLL2 500 1 5\r\nabcde\r\n"))
-	res, err = reader.ReadBytes('\n')
-	if err != nil || string(res) != "Redirect to server 1\r\n" {
-		tester <- false
-	}
-	conn.Close()
-
-	tester <- true
 
 }
 
@@ -470,7 +545,8 @@ func TestSetnExp(t *testing.T) {
 
 func check_SetnExp(t *testing.T, tester chan bool) {
 
-	conn, error := net.Dial("tcp", "127.0.0.1:9001")
+	LeaderAdd := "127.0.0.1:900" + get_LeaderId("1")
+	conn, error := net.Dial("tcp", LeaderAdd)
 	if error != nil {
 		tester <- false
 		conn.Close()
@@ -557,7 +633,8 @@ func TestSetnCas(t *testing.T) {
 
 func check_SetnCas(t *testing.T, tester chan bool) {
 
-	conn, error := net.Dial("tcp", "127.0.0.1:9001")
+	LeaderAdd := "127.0.0.1:900" + get_LeaderId("1")
+	conn, error := net.Dial("tcp", LeaderAdd)
 	if error != nil {
 		tester <- false
 		conn.Close()
@@ -632,7 +709,8 @@ func TestSetnDel(t *testing.T) {
 
 func check_SetnDel(t *testing.T, tester chan bool) {
 
-	conn, error := net.Dial("tcp", "127.0.0.1:9001")
+	LeaderAdd := "127.0.0.1:900" + get_LeaderId("1")
+	conn, error := net.Dial("tcp", LeaderAdd)
 	if error != nil {
 		tester <- false
 		conn.Close()
@@ -660,6 +738,7 @@ func check_SetnDel(t *testing.T, tester chan bool) {
 	conn.Close()
 }
 
+/*
 //..............................................................................................................................//
 
 // Testcase: To test whether multiple clients works together properly.
@@ -669,9 +748,10 @@ func check_SetnDel(t *testing.T, tester chan bool) {
 func TestMulticlient(t *testing.T) {
 
 	tester := make(chan int)
-
+        Serv := returnRandServ()
+        LeaderIdReturned := get_LeaderId(strconv.Itoa(Serv))
 	for i := 0; i < noOfThreads; i++ {
-		go multiclient(t, tester)
+		go multiclient(t, tester, LeaderIdReturned)
 	}
 
 	count := 0
@@ -686,14 +766,17 @@ func TestMulticlient(t *testing.T) {
 
 }
 
-func multiclient(t *testing.T, tester chan int) {
+func multiclient(t *testing.T, tester chan int, LeaderIdReturned string) {
 
-	conn, err := net.Dial("tcp", "127.0.0.1:9001")
-	if err != nil {
+        //Serv := returnRandServ()
+	//LeaderIdReturned := get_LeaderId(strconv.Itoa(Serv))
+	LeaderAdd := "127.0.0.1:900" + LeaderIdReturned
+	conn, error := net.Dial("tcp", LeaderAdd)
+	if error != nil {
 		conn.Close()
 	}
 	reader := bufio.NewReader(conn)
-	io.Copy(conn, bytes.NewBufferString("set key 500 2\r\ntj\r\n"))
+	io.Copy(conn, bytes.NewBufferString("set key71 500 2\r\ntj\r\n"))
 	res, err := reader.ReadBytes('\n')
 	if err != nil {
 		conn.Close()
@@ -708,116 +791,50 @@ func multiclient(t *testing.T, tester chan int) {
 	conn.Close()
 }
 
-//..............................................................................................................................//
-
-//TestConcurrentMulti() tests ability of system to sustain multiple commands from multiple clients and ensures clients are responded with proper response to clients.
+*/
 
 //..............................................................................................................................//
-func TestConcurrentMulti(t *testing.T) {
 
-	commands = []string{
-		"set DUMMYKEY 15 10\r\nDUMMYVALUE\r\n",
-		"set DUMMYKEY2 15 10\r\nDUMMYVALUE\r\n",
-		"delete DUMMYKEY2\r\n",
-		"delete DUMMYKEY\r\n",
-		"getm DUMMYKEY2\r\n",
-	}
+// Testcase to test Basic Set and Get (checking log replication, using server killing)
+
+//..............................................................................................................................//
+
+func TestSetnGetKill(t *testing.T) {
 
 	tester := make(chan bool)
-
-	i := 0
-	for i < noOfThreads {
-		go CheckConcurrentMulti(t, tester)
-		i += 1
-	}
-	i = 0
-
-	for i < noOfThreads {
-		<-tester
-		i += 1
-	}
-
-}
-
-func CheckConcurrentMulti(t *testing.T, tester chan bool) {
-	conn, err := net.Dial("tcp", "127.0.0.1:9001")
-	if err != nil {
-		t.Error(err)
-		tester <- true
-		return
-	}
-	reader := bufio.NewReader(conn)
-	i := 0
-	randomGenerator := rand.New(rand.NewSource(time.Now().UnixNano()))
-	for i < noOfRequestsPerThread {
-		index := randomGenerator.Int() % len(commands)
-		io.Copy(conn, bytes.NewBufferString(commands[index]))
-
-		data, _ := reader.ReadBytes('\n')
-		input := strings.TrimRight(string(data), "\r\n")
-		array := strings.Split(input, " ")
-		result := array[0]
-		if result == "VALUE" {
-			data, _ = reader.ReadBytes('\n')
-			input := strings.TrimRight(string(data), "\r\n")
-			temp, _ := strconv.Atoi(array[2])
-			if input != "DUMMYVALUE" && temp <= 15 {
-
-				t.Fail()
-			}
-
-		} else {
-
-			if result != "ERRNOTFOUND" && result != "ERR_VERSION" && result != "DELETED" && result != "OK" {
-
-				t.Fail()
-			}
-		}
-
-		i = i + 1
-	}
-	tester <- true
-	conn.Close()
-}
-//..............................................................................................................................//
-
-//TestConsensusArrived() tests ability of system to to repetedly call append() method until consensus is arrived.
-//For this test we are kill majority servers for some time and then relaunching them.
-
-//..............................................................................................................................//
-
-
-func TestConsensusArrived(t *testing.T) {
-	tester := make(chan bool)
-	go checkConsensusArrived(t, tester)
+	go check_SetnGetKill(t, tester)
 	check := <-tester
 
 	if !check {
-		t.Error("TestConsensusArrived Failed, please check implementation")
+		t.Error("SetnGetKill Failed, please check implementation")
 	} else {
 
-		fmt.Println("Testcase - TestConsensusArrived : Passed")
+		fmt.Println("Testcase - TestSetnGetKill : Passed")
 	}
 }
-func checkConsensusArrived(t *testing.T,tester chan bool) {
 
-conn, error := net.Dial("tcp", "127.0.0.1:9001")
+func check_SetnGetKill(t *testing.T, tester chan bool) {
+
+	Serv := returnRandServ()
+
+	LeaderIdReturned := get_LeaderId(strconv.Itoa(Serv))
+	//fmt.Println("hi ",LeaderIdReturned)
+	LeaderId, _ := strconv.Atoi(LeaderIdReturned)
+	LeaderAdd := "127.0.0.1:900" + LeaderIdReturned
+	conn, error := net.Dial("tcp", LeaderAdd)
 	if error != nil {
 		tester <- false
 		conn.Close()
 	}
 
-	io.Copy(conn, bytes.NewBufferString("set Roll101 50 5\r\nTarun\r\n"))
-
+	io.Copy(conn, bytes.NewBufferString("set key51 50 5\r\nTarun\r\n"))
 	reader := bufio.NewReader(conn)
 	resp, error := reader.ReadBytes('\n')
-	//fmt.Println(res)
-	res := string(resp)
 	if error != nil {
 		conn.Close()
 	} else {
-		if len(res) > 0 {
-			response := strings.Split(strings.TrimSpace(res), " ")
+		if len(string(resp)) > 0 {
+			response := strings.Split(strings.TrimSpace(string(resp)), " ")
 			if response[0] != "OK" {
 				tester <- false
 				conn.Close()
@@ -830,44 +847,198 @@ conn, error := net.Dial("tcp", "127.0.0.1:9001")
 
 	}
 
+	killServer(LeaderId)
 
-slice := []int{3, 4, 5}
+	Serv1 := returnRandServ()
+	//fmt.Println(servermap)
+	//fmt.Println(Serv1)
 
- for _,elem := range slice{
-	if err := procmap[elem].Process.Kill(); err != nil {
-            t.Log("failed to kill: ", err)
-        }
- 	t.Log("YOOYOYOYOYOMMMMMMMM")
-  	wgroup.Done()
- }
+	LeaderIdReturned1 := get_LeaderId(strconv.Itoa(Serv1))
+	//fmt.Println(LeaderIdReturned1)
 
-time.Sleep(100 * time.Second)
+	LeaderId1, _ := strconv.Atoi(LeaderIdReturned1)
 
+	//fmt.Println(LeaderId1)
 
+	killServer(LeaderId1)
+	//time.Sleep(time.Second * 1)
+	Serv2 := returnRandServ()
+	//fmt.Println(servermap)
+	//fmt.Println(Serv2)
 
-io.Copy(conn, bytes.NewBufferString("get Roll101\r\n"))
-	resp, error = reader.ReadBytes('\n')
-	//fmt.Println(res)
-	res = string(resp)
+	LeaderIdReturned2 := get_LeaderId(strconv.Itoa(Serv2))
+	//fmt.Println(LeaderIdReturned2)
+	//LeaderId2,_ := strconv.Atoi(LeaderIdReturned2)
+
+	LeaderAdd = "127.0.0.1:900" + LeaderIdReturned2
+	conn1, error := net.Dial("tcp", LeaderAdd)
 	if error != nil {
-		conn.Close()
+		tester <- false
+		conn1.Close()
+	}
+
+	io.Copy(conn1, bytes.NewBufferString("get key51\r\n"))
+	reader = bufio.NewReader(conn1)
+	resp, error = reader.ReadBytes('\n')
+	if error != nil {
+		conn1.Close()
 	} else {
-		response := strings.Split(strings.TrimSpace(res), " ")
+		response := strings.Split(strings.TrimSpace(string(resp)), " ")
 		if response[0] == "VALUE" || response[1] == "5" {
 
-			res, error = reader.ReadString('\n')
+			res, error := reader.ReadString('\n')
 			if error != nil {
-				conn.Close()
+				conn1.Close()
 			} else {
 
 				if res == "Tarun\r\n" {
 					tester <- true
-					conn.Close()
+					conn1.Close()
 				} else {
 					tester <- false
-					conn.Close()
+					conn1.Close()
 				}
 
+			}
+
+		} else {
+			tester <- false
+			conn1.Close()
+		}
+
+	}
+
+	//wgroup.Add(1)
+	go execute_cmd(LeaderId) //restarting the killed servers
+
+	//wgroup.Add(1)
+	go execute_cmd(LeaderId1) //restarting the killed servers
+	//time.Sleep(time.Second * 2)
+
+	//tester <- true
+	//wgroup.Wait()
+	conn1.Close()
+}
+
+//..............................................................................................................................//
+
+// Testcase to test Leader Election - 2 (Killing the Fisrt Leader And another random Server)
+
+//..............................................................................................................................//
+
+func TestLeaderElect2(t *testing.T) {
+
+	tester := make(chan bool)
+	time.Sleep(time.Second * 2)
+	go check_LeaderElect2(t, tester)
+	check := <-tester
+
+	if !check {
+		t.Error("TestLeaderElect2 Failed, please check implementation")
+	} else {
+
+		fmt.Println("Testcase - TestLeaderElect2 : Passed")
+	}
+}
+
+func check_LeaderElect2(t *testing.T, tester chan bool) {
+
+	Serv := returnRandServ()
+	//fmt.Println("hi = ",Serv)
+	LeaderIdReturned := get_LeaderId(strconv.Itoa(Serv))
+	//fmt.Println("hi = ",LeaderIdReturned)
+
+	LeaderId, _ := strconv.Atoi(LeaderIdReturned)
+	killServer(LeaderId)
+
+	Serv1 := returnRandServ()
+	killServer(Serv1)
+	//fmt.Println(Serv1)
+	Serv2 := returnRandServ()
+	//time.Sleep(time.Second * 2)
+	//fmt.Println(Serv2)
+
+	LeaderIdReturned = get_LeaderId(strconv.Itoa(Serv2))
+
+	LeaderAdd := "127.0.0.1:900" + LeaderIdReturned
+	//fmt.Println(LeaderAdd)
+
+	conn, error := net.Dial("tcp", LeaderAdd)
+	if error != nil {
+		tester <- false
+		conn.Close()
+	}
+
+	io.Copy(conn, bytes.NewBufferString("get LeaderTester\r\n"))
+	reader := bufio.NewReader(conn)
+	resp, error := reader.ReadBytes('\n')
+	if error != nil {
+		conn.Close()
+	} else {
+		response := strings.Split(strings.TrimSpace(string(resp)), " ")
+		if response[0] == "ERRNOTFOUND" {
+			tester <- true
+			conn.Close()
+		} else {
+			tester <- false
+			conn.Close()
+		}
+
+	}
+
+	//wgroup.Add(1)
+	go execute_cmd(LeaderId)
+	//wgroup.Add(1)
+	go execute_cmd(Serv1)
+	//tester<-true
+
+}
+
+//..............................................................................................................................//
+
+// Testcase to test Basic Set and Get (checking log replication, using server killing)
+
+//..............................................................................................................................//
+
+func TestSetnGetKillMajority(t *testing.T) {
+
+	tester := make(chan bool)
+	go check_SetnGetKillMajority(t, tester)
+	check := <-tester
+
+	if !check {
+		t.Error("SetnGetKillMajority Failed, please check implementation")
+	} else {
+
+		fmt.Println("Testcase - TestSetnGetKillMajority : Passed")
+	}
+}
+
+func check_SetnGetKillMajority(t *testing.T, tester chan bool) {
+
+	Serv := returnRandServ()
+
+	LeaderIdReturned := get_LeaderId(strconv.Itoa(Serv))
+	//fmt.Println("hi ",LeaderIdReturned)
+	LeaderId, _ := strconv.Atoi(LeaderIdReturned)
+	LeaderAdd := "127.0.0.1:900" + LeaderIdReturned
+	conn, error := net.Dial("tcp", LeaderAdd)
+	if error != nil {
+		tester <- false
+		conn.Close()
+	}
+
+	io.Copy(conn, bytes.NewBufferString("set key51 50 5\r\nTarun\r\n"))
+	reader := bufio.NewReader(conn)
+	resp, error := reader.ReadBytes('\n')
+	if error != nil {
+		conn.Close()
+	} else {
+		if len(string(resp)) > 0 {
+			response := strings.Split(strings.TrimSpace(string(resp)), " ")
+			if response[0] != "OK" {
+				tester <- false
+				conn.Close()
 			}
 
 		} else {
@@ -876,24 +1047,79 @@ io.Copy(conn, bytes.NewBufferString("get Roll101\r\n"))
 		}
 
 	}
-	conn.Close()
 
+	killServer(LeaderId)
 
+	Serv1 := returnRandServ()
+	LeaderIdReturned1 := get_LeaderId(strconv.Itoa(Serv1))
+	LeaderId1, _ := strconv.Atoi(LeaderIdReturned1)
+	killServer(LeaderId1)
 
+	Serv2 := returnRandServ()
+	LeaderIdReturned2 := get_LeaderId(strconv.Itoa(Serv2))
+	LeaderId2, _ := strconv.Atoi(LeaderIdReturned2)
+	killServer(LeaderId2)
 
+	//go restartServerAfterSomeTime(LeaderId2)
 
+	Serv3 := returnRandServ()
+	LeaderIdReturned3 := get_LeaderId(strconv.Itoa(Serv3))
+	//LeaderId3,_ := strconv.Atoi(LeaderIdReturned2)
+	//killServer(LeaderId2)
 
-}
-
-func TestKillAllServers(t *testing.T) {
-	cmd := exec.Command("pkill", "kvstore")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
-	if err != nil {
-		t.Log(err)
+	LeaderAdd = "127.0.0.1:900" + LeaderIdReturned3
+	conn1, error := net.Dial("tcp", LeaderAdd)
+	if error != nil {
+		tester <- false
+		conn1.Close()
 	}
-	cmd.Wait()
+
+	io.Copy(conn1, bytes.NewBufferString("get key51\r\n"))
+	reader = bufio.NewReader(conn1)
+	resp, error = reader.ReadBytes('\n')
+	if error != nil {
+		conn1.Close()
+	} else {
+		response := strings.Split(strings.TrimSpace(string(resp)), " ")
+		if response[0] == "VALUE" || response[1] == "5" {
+
+			res, error := reader.ReadString('\n')
+			if error != nil {
+				conn1.Close()
+			} else {
+
+				if res == "Tarun\r\n" {
+					tester <- true
+					conn1.Close()
+				} else {
+					tester <- false
+					conn1.Close()
+				}
+
+			}
+
+		} else {
+			tester <- false
+			conn1.Close()
+		}
+
+	}
+
+	//wgroup.Add(1)
+	go execute_cmd(LeaderId) //restarting the killed servers
+
+	//wgroup.Add(1)
+	go execute_cmd(LeaderId1) //restarting the killed servers
+	//time.Sleep(time.Second * 2)
+
+	//tester <- true
+	//wgroup.Wait()
+	conn1.Close()
+}
+
+func restartServerAfterSomeTime(LeaderId2 int) {
+
+	time.Sleep(time.Second * 6)
+	go execute_cmd(LeaderId2)
 
 }
-*/

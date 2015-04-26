@@ -4,125 +4,18 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/json"
-	"errors"
+
 	"fmt"
 	zmq "github.com/pebbe/zmq4"
 	"io/ioutil"
 	"log"
 	"math/rand"
-	"strconv"
-	"sync"
-	"time"
 	"os"
+	"sort"
+	"strconv"
+	"time"
 )
 
-var debug = true
-
-//Lock for vote counting
-var voteLock = &sync.RWMutex{}
-
-var voteMap = make(map[int]bool)
-
-type Lsn uint64 //Log sequence number, unique for all time.
-
-//LeaderID denotes id of the leader
-var LeaderID, Quorum int
-
-//Below constants are used to set message IDs.
-const (
-	APPENDENTRIESRPC      = 1
-	CONFIRMCONSENSUS      = 2
-	REQUESTVOTE           = 3
-	VOTERESPONSE          = 4
-	APPENDENTRIES         = 5
-	APPENDENTRIESRESPONSE = 6
-	HEARTBEATRESPONSE     = 7
-	HEARTBEAT             = 8
-	APPENDENTRIESRPCRESPONSE      = 9
-)
-
-const (
-	NOVOTE         = -1
-	UNKNOWN        = -1
-	INITIALIZATION = 0
-)
-
-//Below constants define state of the raft server
-const (
-	FOLLOWER  = 1
-	CANDIDATE = 2
-	LEADER    = 3
-)
-
-const (
-	BROADCAST = -1
-)
-
-var (
-	/*
-	   Both candidate and follower state raft server will wait for random time between min and max election timeout
-	   and once it's wait is over, will start election all over again.
-	*/
-	MinElectTo int32 = 4000
-	MaxElectTo       = 3 * MinElectTo
-)
-
-type ServerConfig struct {
-	Id         string
-	HostName   string
-	ClientPort string
-	LogPort    string
-}
-
-type clusterCount struct {
-	Count string
-}
-
-type serverLogPath struct {
-	Path string
-}
-
-type ClusterConfig struct {
-	Path    serverLogPath  // Directory for persistent log
-	Servers []ServerConfig // All servers in this cluster
-	Count   clusterCount
-}
-
-//Raft is a structure that defines server and also maintains information about cluster.
-type Raft struct {
-	Pid           int
-	Peers         []int
-	Path          string
-	Term          uint64 // Current term ID for raft object.(Monotonic increase)
-	VotedFor      int // Server ID for which this raft has voted in leader election.
-	VotedTerm     int
-	LeaderId      int            //Current Leader ID
-	CommitIndex   uint64         //Index of the highest entry commited till time.(Monotonic increase)
-	MatchIndex    map[int]uint64 //Index fo the highest log entry known to be replicated on server for all peers.
-	NextIndex     map[int]uint64 //Index of the next log entry to send to that server for all peers (initialized to leader last log index + 1)
-	PrevLogIndex  uint64
-	PrevLogTerm   uint64
-	ElectTicker   <-chan time.Time
-	State         int
-	LastApplied   uint64 //Index of the highest log entry applied to state machine.
-	In            chan *Envelope
-	Out           chan *Envelope
-	Address       map[int]string
-	ClientSockets map[int]*zmq.Socket
-	LogSockets    map[int]*zmq.Socket
-	LsnVar        uint64
-	ClusterSize   int
-	GotConsensus  chan bool
-	SLog          *Log
-	Inchan chan *[]byte
-        Outchan chan interface{}
-}
-
-//store index of all peer servers
-type nextIndex struct {
-	sync.RWMutex
-	m map[uint64]uint64 // followerId: nextIndex
-}
 
 //type appendEntriesResponse struct{}
 
@@ -178,9 +71,11 @@ type Server interface {
 
 	handleRequestVote(env *Envelope) bool
 
-	sendHeartBeats(ni *nextIndex) (int, bool)
+	sendHeartBeats(ni *nextIndex, timeout time.Duration) (int, bool)
 
 	handleAppendEntries(env *Envelope) (*appendEntriesResponse, bool)
+
+	ApplyCommandToSM()
 }
 
 func (ServerVar *Raft) Start() {
@@ -278,16 +173,15 @@ func (ServerVar *Raft) loop() {
 	}
 }
 
-func (ServerVar *Raft) catchUpLog(ni *nextIndex, id int) error {
+func (ServerVar *Raft) catchUpLog(ni *nextIndex, id int, timeout time.Duration) error {
 
-	
 	//curLsn := ServerVar.SLog.getCurrentIndex() + 1
 	//resultentries, lastTerm := ServerVar.SLog.entriesAfter(curLsn)
 	currentTerm := ServerVar.Term
 
-	prevLogIndex := ni.prevLogIndex(uint64(id))
+	prevLogIndex := ni.prevLogIndex(uint64(id)) //.........
 
-	resultentries, _ := ServerVar.SLog.entriesAfter(prevLogIndex,10)
+	resultentries, prevLogTerm := ServerVar.SLog.entriesAfter(prevLogIndex, 10)
 
 	//commitIndex := ServerVar.SLog.getCommitIndex()
 
@@ -296,10 +190,16 @@ func (ServerVar *Raft) catchUpLog(ni *nextIndex, id int) error {
 	envVar.MessageId = APPENDENTRIES
 	envVar.SenderId = ServerVar.ServId()
 	envVar.Leaderid = ServerVar.LeaderId
-	envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
-	envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
-	envVar.CommitIndex = ServerVar.GetCommitIndex()
+	envVar.LastLogIndex = prevLogIndex
+	envVar.LastLogTerm = prevLogTerm
+	envVar.CommitIndex = ServerVar.SLog.commitIndex
+	
+//	fmt.Println("APPENDENTRIES sending lsn = ",envVar.LastLsn,"for server = ",id)	
+	
 	envVar.Message = &appendEntries{TermIndex: currentTerm, Entries: resultentries}
+	if debug {
+	fmt.Println("Server ", ServerVar.ServId(), "->", id, " Prev log= ", prevLogIndex, "Prev Term = ", prevLogTerm)
+}
 	ServerVar.Outbox() <- &envVar
 
 	select {
@@ -310,20 +210,35 @@ func (ServerVar *Raft) catchUpLog(ni *nextIndex, id int) error {
 		switch env.MessageId {
 
 		case APPENDENTRIESRESPONSE:
+	
+	id = env.SenderId
+	prevLogIndex = ni.prevLogIndex(uint64(id)) //.........
 
-			/*if debug {
+	resultentries, prevLogTerm = ServerVar.SLog.entriesAfter(prevLogIndex, 10)
+	
+	
+	
+//		fmt.Println("APPENDENTRIESRESPONSE received lsn = ",LastLsn,"for server = ",env.SenderId)
+		
 
-				fmt.Println("Received heartbeat response from %v", id)
+			if debug {
+
+				fmt.Println("Received APPENDENTRIESRESPONSE at RIGHT place")
 			}
-*/
+			
 			resp := env.Message.(appendEntriesResponse)
 			if resp.Term > currentTerm {
+			
+//			fmt.Println("Term not matched hence returing from APPENDENTRIES RESPONSE")
 				return errorDeposed
 			}
 
 			if !resp.Success {
+
 				newPrevLogIndex, err := ni.decrement(uint64(id), prevLogIndex)
-				fmt.Println("new index for ", id, "is", newPrevLogIndex)
+				if debug {
+				fmt.Println("No SUCC: new index for ", id, "is", newPrevLogIndex, "where prev log index was ", prevLogIndex)
+				}
 				if err != nil {
 
 					return err
@@ -336,32 +251,44 @@ func (ServerVar *Raft) catchUpLog(ni *nextIndex, id int) error {
 
 			if len(resultentries) > 0 {
 				newPrevLogIndex, err := ni.set(uint64(id), uint64(resultentries[len(resultentries)-1].Lsn()), prevLogIndex)
-				fmt.Println("new index for ", id, "is", newPrevLogIndex)
+				if debug {
+				fmt.Println("SET : new prev index for ", id, "is", newPrevLogIndex,"Term  = ",resp.Term)
+				}
 				if err != nil {
 
 					return err
 				}
 
 				return nil
-			}
+			} /*else {
+				fmt.Println("NOT SET : new prev index for id =", id,"sender = ",env.SenderId,"Term  = ",resp.Term)
+			}*/
+
 			return nil
-
 		}
-
+	case <-time.After(2 * timeout):
+		return errorTimeout
 	}
 	return nil
 }
 
 func (ServerVar *Raft) handleAppendEntries(env *Envelope) (*appendEntriesResponse, bool) {
 
-	resp := env.Message.(appendEntries)
-	if debug {
-		fmt.Println("handleAppendEntries() : Fo server ", ServerVar.ServId(), " Term : ", ServerVar.Term, " Requested Term = ", resp.TermIndex, "Coommit index ", env.CommitIndex, " ServerVar.SLog.commitIndex ", ServerVar.SLog.commitIndex)
+	if env == nil {
+
+		fmt.Println("Eureka..............")
 	}
 
-	if resp.TermIndex < ServerVar.Term {
+	resp := env.Message.(appendEntries)
+	if debug {
+	fmt.Println("handleAppendEntries() : Fo server ", ServerVar.ServId(), " Term : ", ServerVar.Term, " env Term = ", resp.TermIndex, "Commit index ", env.CommitIndex, " ServerVar.SLog.commitIndex ", ServerVar.SLog.commitIndex)
+}
+	/*if debug {
+		fmt.Println("handleAppendEntries() : Fo server ", ServerVar.ServId(), " Term : ", ServerVar.Term, " Requested Term = ", resp.TermIndex, "Commit index ", env.CommitIndex, " ServerVar.SLog.commitIndex ", ServerVar.SLog.commitIndex)
+	}*/
 
-	
+	if resp.TermIndex < ServerVar.Term {
+//		fmt.Println("Giving false here.....1")
 		return &appendEntriesResponse{
 			Term:    ServerVar.Term,
 			Success: false,
@@ -386,23 +313,23 @@ func (ServerVar *Raft) handleAppendEntries(env *Envelope) (*appendEntriesRespons
 	}
 	ServerVar.resetElectTimeout()
 
-	
+	//	fmt.Println("Server ",ServerVar.ServId(),"Discard ",env.LastLogIndex,env.LastLogTerm," - log ",ServerVar.SLog.lastIndex(),ServerVar.SLog.lastTerm())
 	if err := ServerVar.SLog.discardEntries(env.LastLogIndex, env.LastLogTerm); err != nil {
-	
+
+//		fmt.Println("Giving false here.....2", err)
 		return &appendEntriesResponse{
 			Term:    ServerVar.Term,
 			Success: false,
 			reason:  fmt.Sprintf("while ensuring last log entry had index=%d term=%d: error: %s", env.LastLogIndex, env.LastLogTerm, err)}, downGrade
 	}
 
-	
 	//resp := env.Message.(appendEntries)
 
 	for i, entry := range resp.Entries {
-fmt.Println("Number of times ",i)
-		if err := ServerVar.SLog.appendEntry(entry); err != nil {
 
-			
+		//			fmt.Println("Appending entry for server ",ServerVar.ServId())
+		if err := ServerVar.SLog.appendEntry(entry); err != nil {
+//			fmt.Println("Giving false here.....3")
 			return &appendEntriesResponse{
 				Term:    ServerVar.Term,
 				Success: false,
@@ -415,12 +342,16 @@ fmt.Println("Number of times ",i)
 			}, downGrade
 
 		}
-
+		if debug {
+		fmt.Println("handle() Server ", ServerVar.ServId(), " appendEntry")
+}
 	}
 
 	if env.CommitIndex > 0 && env.CommitIndex > ServerVar.SLog.commitIndex {
 
 		if err := ServerVar.SLog.commitTill(env.CommitIndex); err != nil {
+
+	//		fmt.Println("Giving false here.....4")
 
 			return &appendEntriesResponse{
 				Term:    ServerVar.Term,
@@ -431,31 +362,11 @@ fmt.Println("Number of times ",i)
 
 	}
 
-
 	return &appendEntriesResponse{
 		Term:    ServerVar.Term,
 		Success: true,
 	}, downGrade
 
-}
-
-var (
-	errorTimeout               = errors.New("Time out while log replication")
-	errorDeposed               = errors.New("Deposed during replication")
-	errorOutOfSync             = errors.New("Out of sync")
-	errorappendEntriesRejected = errors.New("AppendEntries RPC rejected")
-)
-
-type appendEntries struct {
-	TermIndex uint64
-	Entries   []*LogEntryStruct
-}
-
-// appendEntriesResponse represents the response to an appendEntries RPC.
-type appendEntriesResponse struct {
-	Term    uint64
-	Success bool
-	reason  string
 }
 
 func (ServerVar *Raft) newNextIndex(defaultNextIndex uint64) *nextIndex {
@@ -464,6 +375,8 @@ func (ServerVar *Raft) newNextIndex(defaultNextIndex uint64) *nextIndex {
 	}
 	for _, id := range ServerVar.PeersIds() {
 		ni.m[uint64(id)] = defaultNextIndex
+		
+		//fmt.Println("INITIALIZEDn ", id, " to ", ni.m[uint64(id)])
 	}
 	return ni
 }
@@ -488,7 +401,12 @@ func (ni *nextIndex) decrement(id uint64, prev uint64) (uint64, error) {
 		return i, errorOutOfSync
 	}
 	if i > 0 {
+
 		ni.m[id]--
+if debug {
+
+		fmt.Println("decremented val ", ni.m[id])
+}
 	}
 	return ni.m[id], nil
 }
@@ -504,10 +422,14 @@ func (ni *nextIndex) set(id, index, prev uint64) (uint64, error) {
 		return i, errorOutOfSync
 	}
 	ni.m[id] = index
+
+if debug {
+	fmt.Println("set val ", ni.m[id])
+}
 	return index, nil
 }
 
-func (ServerVar *Raft) sendHeartBeats(ni *nextIndex) (int, bool) {
+func (ServerVar *Raft) sendHeartBeats(ni *nextIndex, timeout time.Duration) (int, bool) {
 
 	type tuple struct {
 		id  uint64
@@ -517,7 +439,7 @@ func (ServerVar *Raft) sendHeartBeats(ni *nextIndex) (int, bool) {
 	for _, id1 := range ServerVar.PeersIds() {
 		go func(id int) {
 			errChan := make(chan error, 1)
-			go func() { errChan <- ServerVar.catchUpLog(ni, id) }()
+			go func() { errChan <- ServerVar.catchUpLog(ni, id, timeout) }()
 			responses <- tuple{uint64(id), <-errChan}
 		}(id1)
 	}
@@ -556,43 +478,54 @@ func (ServerVar *Raft) leader() {
 
 	for {
 		select {
-		
-		
+
 		case t := <-ServerVar.Outchan:
-cmd := t.(Command)
-// Append the command to our (leader) log
-fmt.Println("got command, appending", ServerVar.Term)
-currentTerm := ServerVar.Term
 
-		comma := new(bytes.Buffer)
-		encCommand := gob.NewEncoder(comma)
-		encCommand.Encode(cmd)
+			cmd := t.(*CommandTuple)
+			// Append the command to our (leader) log
+	
+	if debug {		fmt.Println("got command, appending", ServerVar.Term)
+	
+	}
+			currentTerm := ServerVar.Term
+			comma := new(bytes.Buffer)
+			encCommand := gob.NewEncoder(comma)
+			encCommand.Encode(cmd)
+			/*
+				entry1 := new(Command)
+				value := cmd.Com
+				b := bytes.NewBufferString(string(value))
+				dec := gob.NewDecoder(b)
+				_ = dec.Decode(entry1)
 
-entry := &LogEntryStruct{
-		Logsn: Lsn(ServerVar.SLog.lastIndex() + 1),
-		TermIndex: currentTerm,
-		DataArray: comma.Bytes(),
-		//Commit : <- false,//cmd.CommandResponse,
-		}
 
-		if err := ServerVar.SLog.appendEntry(entry); err != nil {
-		panic(err)
-		continue
-		}
+				//tp := cmd.Com.(Command)
+				fmt.Println("SERVER ",ServerVar.ServId(),"Command Received on  ",entry1.CmdType)
+			*/
+			//fmt.Println("SERVER ",ServerVar.ServId(),"Command Received on  ",entry1.CmdType)
+			entry := &LogEntryStruct{
+				Logsn:     Lsn(ServerVar.SLog.lastIndex() + 1),
+				TermIndex: currentTerm,
+				DataArray: cmd.Com, //comma.Bytes(),
+				Commit:    cmd.ComResponse,
+			}
 
-fmt.Printf(
-"after append, commitIndex=%d lastIndex=%d lastTerm=%d",
-ServerVar.SLog.getCommitIndex(),
-ServerVar.SLog.lastIndex(),
-ServerVar.SLog.lastTerm(),
-)
-go func() { replicate <- struct{}{} }()
-		
-		
+			if err := ServerVar.SLog.appendEntry(entry); err != nil {
+				panic(err)
+				continue
+			}
+if debug {
+
+			fmt.Printf(" Leader after append, commitIndex=%d lastIndex=%d lastTerm=%d", ServerVar.SLog.getCommitIndex(), ServerVar.SLog.lastIndex(), ServerVar.SLog.lastTerm())
+}
+			go func() {
+//				fmt.Println("sending replicate")
+				replicate <- struct{}{}
+			}()
 
 		case <-replicate:
-
-			successes, downGrade := ServerVar.sendHeartBeats(nIndex)
+//			fmt.Println("HBT")
+			successes, downGrade := ServerVar.sendHeartBeats(nIndex, 2*heartBeatInterval())
 
 			if downGrade {
 
@@ -602,13 +535,57 @@ go func() { replicate <- struct{}{} }()
 
 				return
 			}
-
+//			fmt.Println("Successes ---> ", successes)
 			if successes >= Quorum-1 {
+
+				var indices []uint64
+				indices = append(indices, ServerVar.SLog.currentIndex())
+				for _, i := range nIndex.m {
+					indices = append(indices, i)
+				}
+				sort.Sort(uint64Slice(indices))
+
+				commitIndex := indices[Quorum-1]
+
+				committedIndex := ServerVar.SLog.commitIndex
+
+				peersBestIndex := commitIndex
+
+				ourLastIndex := ServerVar.SLog.lastIndex()
+
+				ourCommitIndex := ServerVar.SLog.getCommitIndex()
+
+				/*if ServerVar.Inprocess == true{
+				MutexAppend.Unlock()
+				ServerVar.Inprocess = false
+				}*/
+
+				if peersBestIndex > ourLastIndex {
+					ServerVar.LeaderId = UNKNOWN
+					ServerVar.VotedFor = NOVOTE
+					ServerVar.State = FOLLOWER
+					return
+				}
+
+				if commitIndex > committedIndex {
+					// leader needs to do a fsync before committing log entries
+					if err := ServerVar.SLog.commitTill(peersBestIndex); err != nil {
+
+						continue
+					}
+					if ServerVar.SLog.getCommitIndex() > ourCommitIndex {
+						//r.logger.Printf("after commitTo(%d), commitIndex=%d -- queueing another flush", peersBestIndex, r.log.getCommitIndex())
+						go func() { replicate <- struct{}{} }()
+					}
+				}
 
 			}
 
 		case env := <-(ServerVar.Inbox()):
 			switch env.MessageId {
+
+
+
 
 			case REQUESTVOTE:
 
@@ -630,19 +607,25 @@ go func() { replicate <- struct{}{} }()
 			case VOTERESPONSE:
 
 			case APPENDENTRIES:
-
+				if debug {
+				fmt.Println("Received APPENDENTRIES for ", ServerVar.ServId())
+				}
 				resp, down := ServerVar.handleAppendEntries(env)
+
 
 				var envVar Envelope
 				envVar.Pid = env.Leaderid
 				envVar.MessageId = APPENDENTRIESRESPONSE
 				envVar.SenderId = ServerVar.ServId()
 				envVar.Leaderid = ServerVar.LeaderId
-				envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
-				envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
-				envVar.CommitIndex = ServerVar.GetCommitIndex()
+				envVar.LastLogIndex = env.LastLogIndex
+				envVar.LastLogTerm = env.LastLogTerm
+				envVar.CommitIndex = env.CommitIndex
+				//envVar.LastLsn = env.LastLsn
 				envVar.Message = resp
-				
+
+
+
 				//fmt.Println("Before sending  ",ServerVar.ServId())
 				ServerVar.Outbox() <- &envVar
 				//fmt.Println("After sending  ",ServerVar.ServId())
@@ -656,6 +639,7 @@ go func() { replicate <- struct{}{} }()
 				}
 
 			case APPENDENTRIESRPC:
+				//fmt.Println("dsuldsdkl REquest received", ServerVar.ServId())
 				resp, down := ServerVar.handleAppendEntries(env)
 
 				var envVar Envelope
@@ -677,13 +661,16 @@ go func() { replicate <- struct{}{} }()
 					return
 
 				}
-				
-			case APPENDENTRIESRPCRESPONSE:
-			fmt.Println("Received....Response.......................")
-				resp := env.Message.(appendEntriesResponse)
-				
-				 ConfirmConsensus(ServerVar.ServId(), ServerVar,&resp)	
-				
+
+			case APPENDENTRIESRESPONSE:
+				if debug {
+
+				fmt.Println("Received APPENDENTRIESRESPONSE at WRONG place")
+			}
+			
+				//_ := env.Message.(appendEntriesResponse)
+
+				//ConfirmConsensus(ServerVar.ServId(), ServerVar,&resp)
 
 			}
 		}
@@ -693,7 +680,7 @@ go func() { replicate <- struct{}{} }()
 }
 
 func heartBeatInterval() time.Duration {
-	tm := MinElectTo / 5
+	tm := MinElectTo / 6
 	return time.Duration(tm) * time.Millisecond
 }
 
@@ -765,7 +752,7 @@ func (ServerVar *Raft) candidate() {
 				voteMap[env.SenderId] = true
 				voteLock.Unlock()
 
-				vcount := 0
+				vcount := 1
 				for i := range ServerVar.PeersIds() {
 					if voteMap[ServerVar.Peers[i]] == true {
 						vcount++
@@ -777,7 +764,7 @@ func (ServerVar *Raft) candidate() {
 
 				}
 
-				if vcount >= Quorum-1 {
+				if vcount >= (Quorum) {
 					ServerVar.LeaderId = ServerVar.ServId()
 					ServerVar.State = LEADER
 					ServerVar.VotedFor = NOVOTE
@@ -790,7 +777,9 @@ func (ServerVar *Raft) candidate() {
 				}
 
 			case APPENDENTRIES:
-
+				if debug {
+				fmt.Println("Received APPENDENTRIES for ", ServerVar.ServId())
+				}
 				resp, down := ServerVar.handleAppendEntries(env)
 
 				var envVar Envelope
@@ -798,9 +787,10 @@ func (ServerVar *Raft) candidate() {
 				envVar.MessageId = APPENDENTRIESRESPONSE
 				envVar.SenderId = ServerVar.ServId()
 				envVar.Leaderid = ServerVar.LeaderId
-				envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
-				envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
-				envVar.CommitIndex = ServerVar.GetCommitIndex()
+				envVar.LastLogIndex = env.LastLogIndex
+				envVar.LastLogTerm = env.LastLogTerm
+				envVar.CommitIndex = env.CommitIndex
+				//envVar.LastLsn = env.LastLsn
 				envVar.Message = resp
 				ServerVar.Outbox() <- &envVar
 
@@ -813,12 +803,11 @@ func (ServerVar *Raft) candidate() {
 
 			case APPENDENTRIESRPC:
 
-				if debug {
-					fmt.Println("CANDIDATE : Processing Message is %v for %d ", env.MessageId, ServerVar.ServId())
-				}
-
+				//fmt.Println("REquest received", ServerVar.ServId(), ServerVar.GetState())
 				resp, down := ServerVar.handleAppendEntries(env)
-
+				if debug {
+					fmt.Println("CANDIDATE : Returned Processing Message is %v for %d ", env.MessageId, ServerVar.ServId())
+				}
 				var envVar Envelope
 				envVar.Pid = env.Leaderid
 				envVar.MessageId = APPENDENTRIESRPCRESPONSE
@@ -828,7 +817,7 @@ func (ServerVar *Raft) candidate() {
 				envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
 				envVar.CommitIndex = ServerVar.GetCommitIndex()
 				envVar.Message = resp
-				
+
 				ServerVar.Outbox() <- &envVar
 
 				if debug {
@@ -851,18 +840,17 @@ func (ServerVar *Raft) candidate() {
 }
 
 func (ServerVar *Raft) requestForVoteToPeers() {
-	
-	
+
 	var lesn LogEntryStruct
 
-	(*ServerVar).LsnVar = (*ServerVar).LsnVar + 1
+	//(*ServerVar).LsnVar = (*ServerVar).LsnVar + 1
 	lesn.Logsn = Lsn((*ServerVar).LsnVar)
 	lesn.DataArray = nil
 	lesn.TermIndex = ServerVar.GetTerm()
-	
-        lesn.Commit = nil
-	
-		var envVar Envelope
+
+	lesn.Commit = nil
+
+	var envVar Envelope
 	envVar.Pid = BROADCAST
 	envVar.MessageId = REQUESTVOTE
 	envVar.SenderId = ServerVar.ServId()
@@ -872,11 +860,9 @@ func (ServerVar *Raft) requestForVoteToPeers() {
 	//TODO: Whats below line??
 	//MsgAckMap[les.Lsn()] = 1
 	ServerVar.VotedFor = ServerVar.ServId()
-	
-	
+
 	ServerVar.Outbox() <- &envVar
-	
-	
+
 }
 
 func (ServerVar *Raft) follower() {
@@ -905,8 +891,6 @@ func (ServerVar *Raft) follower() {
 
 		case env := <-(ServerVar.Inbox()):
 
-			
-
 			//les := LogEntryStruct(env.Message)
 
 			switch env.MessageId {
@@ -924,7 +908,7 @@ func (ServerVar *Raft) follower() {
 			case VOTERESPONSE:
 			//TODO:
 			case APPENDENTRIES:
-
+				//fmt.Println("Received APPENDENTRIES for ", ServerVar.ServId())
 				if ServerVar.LeaderId == UNKNOWN {
 					ServerVar.LeaderId = env.SenderId
 
@@ -932,19 +916,21 @@ func (ServerVar *Raft) follower() {
 
 				resp, down := ServerVar.handleAppendEntries(env)
 
+				//fmt.Println("FOLLOWER: B4 Sending returned from handle ",ServerVar.ServId())
+
 				var envVar Envelope
 				envVar.Pid = env.Leaderid
 				envVar.MessageId = APPENDENTRIESRESPONSE
 				envVar.SenderId = ServerVar.ServId()
 				envVar.Leaderid = ServerVar.LeaderId
-				envVar.LastLogIndex = ServerVar.GetPrevLogIndex()
-				envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
-				envVar.CommitIndex = ServerVar.GetCommitIndex()
+				envVar.LastLogIndex = env.LastLogIndex
+				envVar.LastLogTerm = env.LastLogTerm
+				envVar.CommitIndex = env.CommitIndex
+				//envVar.LastLsn = env.LastLsn
 				envVar.Message = resp
-				
-				fmt.Println("B4 Sending ",ServerVar.ServId())
+
 				ServerVar.Outbox() <- &envVar
-fmt.Println("After Sending ",ServerVar.ServId())
+				//fmt.Println("FOLLOWER: After Sending ",ServerVar.ServId())
 				//TODO: handle and count sucesses
 
 				if down {
@@ -954,9 +940,11 @@ fmt.Println("After Sending ",ServerVar.ServId())
 
 				}
 
-			case APPENDENTRIESRPC:			
+			case APPENDENTRIESRPC:
+				//fmt.Println("REquest received",ServerVar.ServId(),ServerVar.GetState())
 
 				resp, down := ServerVar.handleAppendEntries(env)
+
 				var envVar Envelope
 				envVar.Pid = env.Leaderid
 				envVar.MessageId = APPENDENTRIESRPCRESPONSE
@@ -966,6 +954,7 @@ fmt.Println("After Sending ",ServerVar.ServId())
 				envVar.LastLogTerm = ServerVar.GetPrevLogTerm()
 				envVar.CommitIndex = ServerVar.GetCommitIndex()
 				envVar.Message = resp
+
 				ServerVar.Outbox() <- &envVar
 
 				//TODO: handle and count sucesses
@@ -1020,7 +1009,7 @@ func (serverVar *Raft) handleRequestVote(req *Envelope) bool {
 
 	var lesn LogEntryStruct
 
-	(*serverVar).LsnVar = (*serverVar).LsnVar + 1
+	//(*serverVar).LsnVar = (*serverVar).LsnVar + 1
 	lesn.Logsn = Lsn((*serverVar).LsnVar)
 	lesn.DataArray = nil
 	lesn.TermIndex = serverVar.GetTerm()
@@ -1062,8 +1051,6 @@ func FireAServer(myid int) Server {
 
 	json.Unmarshal(file, &obj)
 
-
-
 	logfile := os.Getenv("GOPATH") + "/log/log_" + strconv.Itoa(myid)
 
 	tLog := createNewLog(logfile)
@@ -1090,11 +1077,12 @@ func FireAServer(myid int) Server {
 		ClientSockets: make(map[int]*zmq.Socket),
 		LsnVar:        0,
 		LogSockets:    make(map[int]*zmq.Socket),
-		Inchan: make(chan *[]byte, 1024),
-		Outchan: make(chan interface{}),
+		Inchan:        make(chan *LogEntryStruct),
+		Outchan:       make(chan interface{}),
 		ClusterSize:   len(obj.Servers) - 1,
 		GotConsensus:  make(chan bool),
 		SLog:          tLog,
+		Inprocess:     false,
 	}
 
 	count := 0
@@ -1135,9 +1123,10 @@ func FireAServer(myid int) Server {
 	gob.Register(LogEntryStruct{})
 	gob.Register(appendEntries{})
 	gob.Register(appendEntriesResponse{})
+	gob.Register(Command{})
 
 	no_servers, _ := strconv.Atoi(obj.Count.Count)
-	Quorum = int(no_servers/2 + 1.0)
+	Quorum = int((no_servers-1)/2 + 1.0)
 	for i := range serverVar.PeersIds() {
 		serverVar.LogSockets[serverVar.Peers[i]], _ = zmq.NewSocket(zmq.PUSH)
 		serverVar.LogSockets[serverVar.Peers[i]].SetSndtimeo(time.Millisecond * 30)
@@ -1158,10 +1147,12 @@ func FireAServer(myid int) Server {
 	// Fork methods for communication within cluster
 
 	//fmt.Println("Leader = ", LeaderID)
-	
+
 	serverVar.SLog.ApplyFunc = func(e *LogEntryStruct) {
-		serverVar.Inchan <- &(e.DataArray)
-		}
+
+		//fmt.Println("ApplyFunc() --> ", e.Logsn)
+		serverVar.Inchan <- e
+	}
 	go SendMail(serverVar)
 	go GetMail(serverVar)
 
@@ -1190,6 +1181,7 @@ func SendMail(serverVar *Raft) {
 			}
 
 		} else {
+
 			network.Reset()
 			a := envelope.Pid
 			envelope.Pid = serverVar.ServId()
@@ -1198,7 +1190,9 @@ func SendMail(serverVar *Raft) {
 			if err != nil {
 				panic("gob error: " + err.Error())
 			}
+
 			serverVar.LogSockets[a].Send(network.String(), 0)
+
 		}
 
 	}
@@ -1229,48 +1223,47 @@ func GetMail(ServerVar *Raft) {
 			log.Fatal("decode:", err)
 		}
 
-/*		if env.MessageId == 1 {
+		/*		if env.MessageId == 1 {
 
-			go AppendEntriesRPC(ServerVar.ServId(), ServerVar)
+					go AppendEntriesRPC(ServerVar.ServId(), ServerVar)
 
-		} else if env.MessageId == 2 {
+				} else if env.MessageId == 2 {
 
-			go ConfirmConsensus(ServerVar.ServId(), ServerVar)
-		}*/
+					go ConfirmConsensus(ServerVar.ServId(), ServerVar)
+				}*/
 		(ServerVar.Inbox()) <- env
 
 	}
 }
 
 // Function to check if consensus from majority is achieved or not
-func ConfirmConsensus(Servid int, ServerVar *Raft,resp *appendEntriesResponse) {
+func ConfirmConsensus(Servid int, ServerVar *Raft, resp *appendEntriesResponse) {
 
+	if resp.Success {
 
-	if resp.Success{
+		env := <-(ServerVar.Inbox())
 
-	env := <-(ServerVar.Inbox())
+		les := env.Message.(LogEntryStruct)
 
-	les := env.Message.(LogEntryStruct)
+		if _, exist := MsgAckMap[les.Lsn()]; exist {
 
-	if _, exist := MsgAckMap[les.Lsn()]; exist {
+			MsgAckMap[les.Lsn()]++
 
-		MsgAckMap[les.Lsn()]++
+		} else {
 
-	} else {
+			//Ignoring ACK since consensus already achieved
+			return
+		}
 
-		//Ignoring ACK since consensus already achieved
-		return
-	}
+		if MsgAckMap[les.Lsn()] == Quorum {
 
-	if MsgAckMap[les.Lsn()] == Quorum {
+			les.Commit <- true
+			(ServerVar.GotConsensus) <- true
+			CommitCh <- les
+			delete(MsgAckMap, les.Lsn())
+			MutexAppend.Unlock()
+		}
 
-		les.Commit <- true
-		(ServerVar.GotConsensus) <- true
-		CommitCh <- les
-		delete(MsgAckMap, les.Lsn())
-		MutexAppend.Unlock()
-	}
-	
 	}
 	return
 }
